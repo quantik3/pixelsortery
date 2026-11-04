@@ -25,6 +25,11 @@ rand = "0.8.5"
 rayon = "1.10.0"
 rfd = "0.14.1"
 
+[profile.release]
+# Slower to build, but a noticeably faster program
+codegen-units = 1
+lto = "thin"
+
 [patch.crates-io]
 egui-video = { git = "https://github.com/Lxtharia/egui-video", rev = "72c6eef5c" }
 # egui-video = { path = "deps/egui-video" }

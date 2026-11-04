@@ -98,6 +98,86 @@ impl PathCreator {
 
         return pixels;
     }
+
+    /// Creates the paths as lists of pixel indices (index = y * w + x).
+    ///
+    /// Same rules as `create_paths`: consecutive duplicates are removed, invalid indices are skipped
+    /// and every pixel belongs to the first path that contains it, so the paths never overlap.
+    ///
+    /// If a mask is given (one byte per pixel), only pixels with a mask value >= 128 are sorted.
+    /// Pixels outside the mask are left untouched and split a path into separate parts,
+    /// so no pixel is ever moved across an unmasked area.
+    pub fn create_index_paths(self, w: u64, h: u64, reverse: bool, mask: Option<&[u8]>) -> Vec<Vec<u64>> {
+        let total_timestart = Instant::now();
+        let mut all_paths_indices = match self {
+            PathCreator::AllHorizontally => path_all_horizontally(w, h),
+            PathCreator::AllVertically => path_all_vertically(w, h),
+            PathCreator::HorizontalLines => path_horizontal_lines(w, h),
+            PathCreator::VerticalLines => path_vertical_lines(w, h),
+            PathCreator::Rays => path_rays(w, h),
+            PathCreator::SquareSpiral => path_rect_spiral(w, h, true),
+            PathCreator::RectSpiral => path_rect_spiral(w, h, false),
+            PathCreator::Diagonally(angle) => path_diagonal_lines(w, h, angle),
+            PathCreator::Circles => path_circles(w, h),
+            PathCreator::Spiral => path_round_spiral(w, h),
+            PathCreator::Hilbert => gilbert::path_hilbert(w, h),
+            PathCreator::X3(offset_y, scalar_w, scalar_l) => path_x3(w, h, offset_y, scalar_w as f64, scalar_l as f64),
+        };
+        let timeend_pathing = total_timestart.elapsed();
+
+        // Reverse spans if nessesary
+        if reverse {
+            all_paths_indices.par_iter_mut().for_each(|p| p.reverse());
+        }
+
+        let pixelcount = (w * h) as usize;
+        // Ignore a mask that doesn't fit the image
+        let mask = mask.filter(|m| m.len() >= pixelcount);
+        let mut taken = vec![false; pixelcount];
+        let mut paths: Vec<Vec<u64>> = Vec::with_capacity(all_paths_indices.len());
+
+        for mut path in all_paths_indices {
+            path.dedup();
+            match mask {
+                None => {
+                    path.retain(|&i| {
+                        let i = i as usize;
+                        if i < pixelcount && !taken[i] {
+                            taken[i] = true;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if !path.is_empty() {
+                        paths.push(path);
+                    }
+                }
+                Some(mask) => {
+                    let mut part = Vec::new();
+                    for i in path {
+                        let iu = i as usize;
+                        if iu >= pixelcount || taken[iu] {
+                            continue;
+                        }
+                        taken[iu] = true;
+                        if mask[iu] >= 128 {
+                            part.push(i);
+                        } else if !part.is_empty() {
+                            paths.push(std::mem::take(&mut part));
+                        }
+                    }
+                    if !part.is_empty() {
+                        paths.push(part);
+                    }
+                }
+            }
+        }
+
+        info!("TIME | [Index Pathing]:  \t+ {:?}", timeend_pathing);
+        info!("TIME | [Creating Paths]: \t= {:?}", total_timestart.elapsed());
+        paths
+    }
 }
 
 /// Creates and returns ranges of mutable Pixels.

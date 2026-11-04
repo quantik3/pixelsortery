@@ -326,6 +326,72 @@ impl PixelsorterGui {
             });
     }
 
+    pub(super) fn mask_panel(&mut self, ui: &mut Ui) {
+        ui.set_width(full_width(&ui));
+        let enabled = self.layered_sorter.is_some();
+        let has_mask = self
+            .layered_sorter
+            .as_ref()
+            .map(|ls| ls.get_current_paint_mask().is_some())
+            .unwrap_or(false);
+        // What to do with the mask after the buttons were drawn
+        let mut new_mask: Option<Option<GrayImage>> = None;
+
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(important_text("Mask"));
+                ui.checkbox(&mut self.mask_edit, "Draw mask [B]");
+                ui.checkbox(&mut self.show_mask_overlay, "Show overlay");
+            });
+            ui.add_enabled_ui(self.mask_edit, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.brush_erase, false, "Paint");
+                    ui.selectable_value(&mut self.brush_erase, true, "Erase");
+                    ui.label("Size");
+                    let slider = egui::Slider::new(&mut self.brush_radius, 1.0..=1000.0)
+                        .logarithmic(true)
+                        .clamping(SliderClamping::Never)
+                        .max_decimals(0)
+                        .suffix(" px");
+                    ui.add(slider);
+                });
+            });
+            ui.horizontal(|ui| {
+                if let Some(ls) = &self.layered_sorter {
+                    if ui.button("Fill").on_hover_text("Sort the whole image (mask everything)").clicked() {
+                        new_mask = Some(Some(ls.new_paint_mask(255)));
+                    }
+                    if ui.button("Empty").on_hover_text("Sort nothing, then paint where to sort").clicked() {
+                        new_mask = Some(Some(ls.new_paint_mask(0)));
+                    }
+                    if ui.add_enabled(has_mask, Button::new("Invert")).clicked() {
+                        if let Some(mask) = ls.get_current_paint_mask() {
+                            let mut inverted = mask.clone();
+                            let raw: &mut [u8] = &mut inverted;
+                            raw.iter_mut().for_each(|v| *v = 255 - *v);
+                            new_mask = Some(Some(inverted));
+                        }
+                    }
+                    if ui.add_enabled(has_mask, Button::new("Remove")).on_hover_text("Remove the mask: the whole image is sorted").clicked() {
+                        new_mask = Some(None);
+                    }
+                }
+            });
+            let hint = if has_mask {
+                "Only the red area is sorted. Left click paints, right click erases."
+            } else if self.mask_edit {
+                "No mask yet: the whole image is sorted. Paint on the image to sort only there."
+            } else {
+                "No mask: the whole image is sorted."
+            };
+            ui.label(RichText::new(hint).small());
+        });
+
+        if let Some(mask) = new_mask {
+            self.replace_paint_mask(mask);
+        }
+    }
+
     pub(super) fn save_options_panel(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.set_width(full_width(&ui));
@@ -458,12 +524,13 @@ impl PixelsorterGui {
                 let values = layer.get_sorting_values();
 
                 let layer_name = RichText::new(format!(
-                    "[{}] {}",
+                    "[{}] {}{}",
                     i,
                     layer
                         .get_sorting_values()
                         .to_pixelsorter()
-                        .to_pretty_short_string()
+                        .to_pretty_short_string(),
+                    if layer.has_paint_mask() { " [M]" } else { "" }
                 ));
 
                 let button = SelectableLabel::new(

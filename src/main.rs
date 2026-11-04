@@ -78,6 +78,7 @@ const HELP_STRING: &str = "
    --quiet        : Make the program shut up
 
    --show-mask    : Outputs a mask showing what areas would be sorted (requires --thres)
+   --mask <FILE>  : Only sort where this black/white image is white (must have the image size)
    --gui          : Starts the gui;
                     | When using the gui, setting <output> is optional
    [VIDEO]
@@ -156,6 +157,7 @@ fn main() {
     let mut ps = pixelsortery::Pixelsorter::new();
     let mut do_reverse = false;
     let mut show_mask = false;
+    let mut paint_mask_path: Option<String> = None;
     let mut start_gui = false;
 
     #[cfg(feature = "video")]
@@ -177,6 +179,7 @@ fn main() {
 
             "--gui" => start_gui = true,
             "--show-mask" => show_mask = true,
+            "--mask" => paint_mask_path = Some(parse_parameter::<String>(args.pop_front(), "--mask <FILE>")),
 
             #[cfg(feature = "video")]
             "--at" => frame_ts = Some(parse_parameter::<f32>(args.pop_front(), "--at <frame_timestamp> Timestamp is the frame number in the time base of the stream")),
@@ -322,8 +325,25 @@ fn main() {
             exit(-1);
         }
     } else {
+        // Load the painted mask, if given
+        let paint_mask = paint_mask_path.map(|path| {
+            match image::open(&path) {
+                Ok(m) => {
+                    let m = m.into_luma8();
+                    if m.dimensions() != img.dimensions() {
+                        eprintln!("[ERROR] The mask '{}' has a different size than the image ({:?} vs {:?})", path, m.dimensions(), img.dimensions());
+                        exit(-1);
+                    }
+                    m
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Could not open mask '{}': {}", path, e);
+                    exit(-1);
+                }
+            }
+        });
         // SORTING
-        ps.sort(&mut img);
+        ps.sort_with_mask(&mut img, paint_mask.as_ref());
     }
 
     let duration = start.elapsed();

@@ -3,11 +3,11 @@ use eframe::egui::{
     self, Align, Button, Color32, Image, Key, Layout, Modifiers, RichText, ScrollArea,
     TextureFilter, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use egui::{scroll_area::ScrollBarVisibility, style::ScrollStyle, ColorImage, Hyperlink, Modal, Rgba};
+use egui::{scroll_area::ScrollBarVisibility, style::ScrollStyle, pos2, ColorImage, Hyperlink, Modal, Pos2, Rect, Response, Rgba, Sense, Stroke};
 use egui_flex::{item, Flex, FlexAlign, FlexAlignContent, FlexJustify};
 #[cfg(feature = "video")]
 use egui_video::PlayerState;
-use image::{Pixel, Rgb, RgbImage, RgbaImage};
+use image::{GrayImage, Pixel, Rgb, RgbImage, RgbaImage};
 use inflections::case::to_title_case;
 use layers::LayeredSorter;
 use log::{info, warn};
@@ -32,6 +32,8 @@ mod layers;
 /// How long the "Saved" Label should be visible before it vanishes
 const SAVED_LABEL_VANISH_TIMEOUT: f32 = 2.0;
 const INITIAL_WINDOW_SIZE: Vec2 = egui::vec2(1000.0, 700.0);
+/// Color of the painted mask overlay (where the image gets sorted)
+const MASK_OVERLAY_COLOR: [u8; 4] = [255, 40, 40, 100];
 
 mod components;
 
@@ -93,6 +95,24 @@ struct PixelsorterGui {
     saving_success_timeout: Option<Instant>,
     change_layer: SwitchLayerMessage,
     show_base_image: bool,
+    /// Painting the mask with the mouse is active
+    mask_edit: bool,
+    /// Show the painted mask on top of the image while painting
+    show_mask_overlay: bool,
+    /// Brush radius in image pixels
+    brush_radius: f32,
+    /// The left mouse button erases instead of paints (the right mouse button always does the opposite)
+    brush_erase: bool,
+    /// Texture of the mask overlay
+    mask_texture: Option<TextureHandle>,
+    /// The mask texture has to be rebuilt (layer changed, mask replaced, ...)
+    mask_texture_dirty: bool,
+    /// A brush stroke is going on (mouse button held down after pressing it on the image)
+    mask_stroke_active: bool,
+    /// The mask was changed by the current stroke
+    mask_stroke_changed: bool,
+    /// Last brush position in image coordinates
+    last_brush_pos: Option<(f32, f32)>,
     #[cfg(feature = "video")]
     audio_device: Option<egui_video::AudioDevice>,
     #[cfg(feature = "video")]
@@ -179,7 +199,7 @@ impl Default for PixelsorterGui {
                     max: 360,
                     criteria: PixelSelectCriteria::Hue,
                 },
-                algorithm: SortingAlgorithm::Shellsort,
+                algorithm: SortingAlgorithm::Mapsort,
 
                 path_diagonally_val: 45.0,
                 path_x3: PathCreator::X3(0, 300, 10.0),
@@ -199,6 +219,15 @@ impl Default for PixelsorterGui {
             change_layer: SwitchLayerMessage::None,
             do_sort: true,
             show_base_image: false,
+            mask_edit: false,
+            show_mask_overlay: true,
+            brush_radius: 30.0,
+            brush_erase: false,
+            mask_texture: None,
+            mask_texture_dirty: true,
+            mask_stroke_active: false,
+            mask_stroke_changed: false,
+            last_brush_pos: None,
             #[cfg(feature = "video")]
             audio_device: None,
             #[cfg(feature = "video")]
@@ -258,10 +287,9 @@ impl PixelsorterGui {
     /// Update texture
     fn update_texture(&mut self, ctx: &egui::Context) {
         if let Some(img) = &self.img {
-            let rgb_data = img.to_vec();
             let colorimg = egui::ColorImage::from_rgb(
                 [img.width() as usize, img.height() as usize],
-                &rgb_data,
+                img.as_raw(),
             );
             let mut options = TextureOptions::default();
             // Make small images stretch without blurring
@@ -273,13 +301,150 @@ impl PixelsorterGui {
     }
 
     /// Tries to show the image if it exists
-    fn show_img(&self, ui: &mut Ui) {
+    fn show_img(&mut self, ui: &mut Ui) {
+        let painting = self.mask_edit && self.layered_sorter.is_some();
         if let Some(tex) = &self.texture {
-            egui::Frame::group(ui.style_mut())
+            let (tex_id, tex_size) = (tex.id(), tex.size_vec2());
+            let sense = if painting { Sense::click_and_drag() } else { Sense::hover() };
+            let response = egui::Frame::group(ui.style_mut())
                 .inner_margin(0)
                 .show(ui, |ui| {
-                    ui.add(Image::new((tex.id(), tex.size_vec2())).shrink_to_fit());
-            });
+                    ui.add(Image::new((tex_id, tex_size)).shrink_to_fit().sense(sense))
+                })
+                .inner;
+            if painting {
+                self.mask_painting(ui, &response);
+            }
+        }
+        if !painting {
+            self.mask_stroke_active = false;
+            self.finish_mask_stroke(ui.ctx());
+        }
+    }
+
+    /// Paints into the mask of the current layer with the mouse and draws the mask overlay and the brush
+    fn mask_painting(&mut self, ui: &mut Ui, response: &Response) {
+        let Some(ls) = &mut self.layered_sorter else { return };
+        let (w, h) = ls.get_base_img().dimensions();
+        let rect = response.rect;
+        if w == 0 || h == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        // Screen pixels per image pixel
+        let (scale_x, scale_y) = (rect.width() / w as f32, rect.height() / h as f32);
+        let to_img = |p: Pos2| ((p.x - rect.min.x) / scale_x, (p.y - rect.min.y) / scale_y);
+
+        let (any_pressed, primary_down, secondary_down, pointer_pos, hover_pos) = ui.input(|i| {
+            (
+                i.pointer.any_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.secondary_down(),
+                i.pointer.interact_pos(),
+                i.pointer.hover_pos(),
+            )
+        });
+
+        // Start a stroke when a mouse button is pressed on the image, end it when all buttons are released
+        if any_pressed && response.hovered() {
+            self.mask_stroke_active = true;
+            self.last_brush_pos = None;
+        }
+        if !(primary_down || secondary_down) {
+            self.mask_stroke_active = false;
+        }
+
+        let mut changed_region = None;
+        if self.mask_stroke_active {
+            if let Some(pos) = pointer_pos {
+                // The right mouse button does the opposite of the selected tool
+                let erase = self.brush_erase != secondary_down;
+                let had_mask = ls.get_current_paint_mask().is_some();
+                let current = to_img(pos);
+                let from = self.last_brush_pos.unwrap_or(current);
+                let mask = ls.get_current_paint_mask_mut();
+                changed_region = paint_mask_stroke(mask, from, current, self.brush_radius, if erase { 0 } else { 255 });
+                if !had_mask {
+                    // The mask was just created, the overlay has to be built from scratch
+                    self.mask_texture_dirty = true;
+                }
+                self.last_brush_pos = Some(current);
+                self.mask_stroke_changed = true;
+            }
+        } else {
+            self.last_brush_pos = None;
+        }
+
+        // Keep the overlay texture up to date
+        let mask = self.layered_sorter.as_ref().and_then(|ls| ls.get_current_paint_mask());
+        match mask {
+            None => self.mask_texture = None,
+            Some(mask) => {
+                let size_matches = self
+                    .mask_texture
+                    .as_ref()
+                    .map(|t| t.size() == [mask.width() as usize, mask.height() as usize])
+                    .unwrap_or(false);
+                if self.mask_texture_dirty || !size_matches {
+                    let full = mask_overlay_image(mask, [0, 0, mask.width(), mask.height()]);
+                    self.mask_texture = Some(ui.ctx().load_texture("mask-overlay", full, mask_texture_options()));
+                } else if let (Some(region), Some(tex)) = (changed_region, &mut self.mask_texture) {
+                    let part = mask_overlay_image(mask, region);
+                    tex.set_partial([region[0] as usize, region[1] as usize], part, mask_texture_options());
+                }
+                self.mask_texture_dirty = false;
+            }
+        }
+
+        // Draw the overlay
+        if self.show_mask_overlay {
+            if let Some(tex) = &self.mask_texture {
+                ui.painter().image(
+                    tex.id(),
+                    rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        // Draw the brush
+        if let Some(p) = hover_pos {
+            if rect.contains(p) || self.mask_stroke_active {
+                let r = (self.brush_radius * scale_x).max(1.0);
+                ui.painter().circle_stroke(p, r, Stroke::new(2.0, Color32::BLACK));
+                ui.painter().circle_stroke(p, r, Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+
+        if self.mask_stroke_active {
+            ui.ctx().request_repaint();
+        } else {
+            self.finish_mask_stroke(ui.ctx());
+        }
+    }
+
+    /// Sorts again after a finished brush stroke
+    fn finish_mask_stroke(&mut self, ctx: &egui::Context) {
+        if self.mask_stroke_changed {
+            self.mask_stroke_changed = false;
+            if let Some(ls) = &mut self.layered_sorter {
+                ls.paint_mask_changed();
+            }
+            if self.auto_sort {
+                self.do_sort = true;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Replaces the mask of the current layer (None = the whole image is sorted)
+    fn replace_paint_mask(&mut self, mask: Option<GrayImage>) {
+        if let Some(ls) = &mut self.layered_sorter {
+            ls.set_current_paint_mask(mask);
+            self.mask_texture_dirty = true;
+            if self.auto_sort {
+                self.do_sort = true;
+            }
         }
     }
 
@@ -302,6 +467,7 @@ impl PixelsorterGui {
                         if let Some(ls) = &mut self.layered_sorter {
                             ls.set_base_img(img.clone());
                         }
+                        self.mask_texture_dirty = true;
                         // I want to make layered_sorter mandatory and remove the possibility of it being None
                         #[cfg(feature = "video")] {
                             self.video_player = None;
@@ -427,6 +593,9 @@ impl eframe::App for PixelsorterGui {
             }
             if i.consume_key(Modifiers::CTRL, Key::O) {
                 do_open_file = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::B) {
+                self.mask_edit = !self.mask_edit;
             }
             if i.consume_key(Modifiers::NONE, Key::M) {
                 self.show_mask = !self.show_mask;
@@ -604,6 +773,13 @@ impl eframe::App for PixelsorterGui {
 
                         ui.add_space(5.0);
 
+                        // PAINTED MASK
+                        ui.group(|ui| {
+                            self.mask_panel(ui);
+                        });
+
+                        ui.add_space(5.0);
+
                         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                             ui.add_space(5.0);
                             // SAVING OPTIONS
@@ -672,6 +848,10 @@ impl eframe::App for PixelsorterGui {
         if let Some(ls) = &mut self.layered_sorter {
             // We are switching layers!!
             // Sort after switching
+            if self.change_layer != SwitchLayerMessage::None {
+                // Another layer might have another mask
+                self.mask_texture_dirty = true;
+            }
             if let SwitchLayerMessage::Layer(i) = self.change_layer {
                 self.change_layer = SwitchLayerMessage::None;
                 ls.select_layer(i);
@@ -808,11 +988,10 @@ pub fn create_frame_filter(sorter: Pixelsorter, time_last_sort_arc: Arc<Mutex<Du
     Box::new(move |frame| {
         let timer = Instant::now();
         let mut img = colimg_to_rgbaimg(frame);
-        let (w, h) = (img.width().into(), img.height().into());
-        let pixels: Vec<&mut Rgb<u8>> = img.pixels_mut().map(|p|{
-            Rgb::from_slice_mut(&mut p.0[0..3])
-        }).collect();
-        sorter.sort_pixels(pixels, w, h);
+        let (w, h) = (img.width() as u64, img.height() as u64);
+        // Sort the RGBA data directly (4 bytes per pixel, alpha stays untouched)
+        let raw: &mut [u8] = &mut img;
+        sorter.sort_raw(raw, 4, w, h, None);
         let newimg = ColorImage::from_rgba_unmultiplied(frame.size, img.as_raw());
         *frame = newimg;
         *time_last_sort_arc.lock().unwrap() = timer.elapsed();
@@ -840,4 +1019,69 @@ fn colimg_to_rgbaimg(cimg: &ColorImage) -> RgbaImage  {
         buffer.push(c.a());
     }
     RgbaImage::from_raw(w as u32, h as u32, buffer).unwrap()
+}
+
+fn mask_texture_options() -> TextureOptions {
+    let mut options = TextureOptions::default();
+    options.magnification = TextureFilter::Nearest;
+    options.minification = TextureFilter::Linear;
+    options
+}
+
+/// Creates the overlay image for a region `[x0, y0, x1, y1]` (end exclusive) of the mask
+fn mask_overlay_image(mask: &GrayImage, region: [u32; 4]) -> ColorImage {
+    let [x0, y0, x1, y1] = region;
+    let w = mask.width();
+    let raw = mask.as_raw();
+    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+    for y in y0..y1 {
+        let row = (y * w) as usize;
+        for x in x0..x1 {
+            if raw[row + x as usize] >= 128 {
+                rgba.extend_from_slice(&MASK_OVERLAY_COLOR);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    ColorImage::from_rgba_unmultiplied([(x1 - x0) as usize, (y1 - y0) as usize], &rgba)
+}
+
+/// Paints a line of circles from `from` to `to` (image coordinates) into the mask.
+/// Returns the changed region `[x0, y0, x1, y1]` (end exclusive), or None if nothing inside the image was touched.
+fn paint_mask_stroke(mask: &mut GrayImage, from: (f32, f32), to: (f32, f32), radius: f32, value: u8) -> Option<[u32; 4]> {
+    let (w, h) = (mask.width() as i64, mask.height() as i64);
+    let r = radius.max(0.5);
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let distance = (dx * dx + dy * dy).sqrt();
+    // Place the circles close enough to get a smooth line
+    let steps = ((distance / (r * 0.3).max(0.5)).ceil() as usize).max(1);
+    let raw: &mut [u8] = mask;
+    let mut region: Option<[i64; 4]> = None;
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let (cx, cy) = (from.0 + dx * t, from.1 + dy * t);
+        let x0 = ((cx - r).floor() as i64).max(0);
+        let y0 = ((cy - r).floor() as i64).max(0);
+        let x1 = ((cx + r).ceil() as i64).min(w - 1);
+        let y1 = ((cy + r).ceil() as i64).min(h - 1);
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+        for y in y0..=y1 {
+            let py = y as f32 + 0.5 - cy;
+            for x in x0..=x1 {
+                let px = x as f32 + 0.5 - cx;
+                if px * px + py * py <= r * r {
+                    raw[(y * w + x) as usize] = value;
+                }
+            }
+        }
+        region = Some(match region {
+            None => [x0, y0, x1 + 1, y1 + 1],
+            Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1 + 1), d.max(y1 + 1)],
+        });
+    }
+    region.map(|[a, b, c, d]| [a as u32, b as u32, c as u32, d as u32])
 }

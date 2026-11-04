@@ -7,7 +7,7 @@ struct PixelWrapper {
 }
 
 fn glitch_swap(
-    pixels: &mut [&mut Rgb<u8>],
+    pixels: &mut [Rgb<u8>],
     wrapper_vec: &mut Vec<PixelWrapper>,
     x: usize,
     y: usize,
@@ -17,27 +17,24 @@ fn glitch_swap(
     let i = wrapper_vec[x].ind;
     let j = wrapper_vec[y].ind;
 
-    // eprint!("  Swap: {:?} ({}) <-> {:?} ({})", pixels[i], wrapper_vec[x].val,pixels[j], wrapper_vec[y].val);
-
     wrapper_vec.swap(x, y);
-    let tmp = pixels[i].clone();
-    *pixels[i] = pixels[j].clone();
-    *pixels[j] = tmp;
-
-    // This does not work:
-    // pixels.swap(i, j);
+    // Swaps the colors at i and j (the pixels are values now, not pointers)
+    pixels.swap(i, j);
 
     // The glitch comes from the fact that
     // We switch wrap_x and wrap_y and then swap their colors
     // But they still point to their initial index
 }
 
-pub fn glitchsort_mut(pixels: &mut [&mut Rgb<u8>], value_function: for<'a> fn(&'a Rgb<u8>) -> u16) {
+pub fn glitchsort_mut(pixels: &mut [Rgb<u8>], value_function: for<'a> fn(&'a Rgb<u8>) -> u16) {
+    if pixels.len() < 2 {
+        return;
+    }
     let span_len = pixels.len() - 1;
-    let mut wrappers = Vec::new();
+    let mut wrappers = Vec::with_capacity(pixels.len());
 
     for i in 0..pixels.len() {
-        let val = value_function(pixels[i]);
+        let val = value_function(&pixels[i]);
         wrappers.push(PixelWrapper { ind: i, val });
     }
 

@@ -47,6 +47,82 @@ impl PixelSelector {
             PixelSelector::Threshold { min, max, criteria } => threshold_selector(pixels, criteria, min, max),
         }
     }
+    /// Returns the spans of a path as index ranges `(start, end)` (end exclusive).
+    ///
+    /// Gives the same spans as `create_spans`, but works on a contiguous slice of pixels
+    /// and doesn't need to move any pixel around.
+    pub fn span_ranges(self, pixels: &[Rgb<u8>]) -> Vec<(usize, usize)> {
+        let n = pixels.len();
+        let mut ranges = Vec::new();
+        match self {
+            PixelSelector::Full => ranges.push((0, n)),
+            PixelSelector::Fixed { len } => {
+                // Prevent an endless loop
+                if len == 0 {
+                    return ranges;
+                }
+                let len = len as usize;
+                let mut start = 0;
+                while n - start >= len {
+                    ranges.push((start, start + len));
+                    start += len;
+                }
+                // The rest
+                ranges.push((start, n));
+            }
+            PixelSelector::Random { max } => {
+                // rng_range cannot be 1..1
+                if max <= 1 {
+                    return ranges;
+                }
+                let mut rng = thread_rng();
+                let rng_range = Uniform::from(1..max as usize);
+                let mut start = 0;
+                loop {
+                    let r = rng_range.sample(&mut rng);
+                    if n - start < r {
+                        break;
+                    }
+                    ranges.push((start, start + r));
+                    start += r;
+                }
+                // The rest
+                ranges.push((start, n));
+            }
+            PixelSelector::Threshold { min, max, criteria } => {
+                // Every possible value is selected anyway: one span with everything.
+                // (hue is in [0, 360], brightness and saturation in [0, 255])
+                let max_possible = if criteria == PixelSelectCriteria::Hue { 360 } else { 255 };
+                if min == 0 && max >= max_possible {
+                    ranges.push((0, n));
+                    return ranges;
+                }
+                let value_function = match criteria {
+                    PixelSelectCriteria::Hue => get_hue,
+                    PixelSelectCriteria::Brightness => get_brightness,
+                    PixelSelectCriteria::Saturation => get_saturation,
+                };
+                let mut span_start: Option<usize> = None;
+                for (i, p) in pixels.iter().enumerate() {
+                    let val = value_function(p) as u64;
+                    let valid = val >= min && val <= max;
+                    match (valid, span_start) {
+                        (true, None) => span_start = Some(i),
+                        (false, Some(s)) => {
+                            ranges.push((s, i));
+                            span_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = span_start {
+                    ranges.push((s, n));
+                }
+            }
+        }
+        ranges
+    }
+
     pub fn info_string<'a>(self) -> String {
         match self {
             PixelSelector::Full => String::from("Selecing all pixels"),

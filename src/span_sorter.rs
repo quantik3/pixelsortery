@@ -66,7 +66,7 @@ impl SpanSorter {
     }
 
     /// Sort a slice of pixels using set criteria and algorithm
-    pub fn sort(&self, pixels: &mut [&mut Rgb<u8>]) {
+    pub fn sort(&self, pixels: &mut [Rgb<u8>]) {
         // Select function per algorithm
         let sorting_function = match self.algorithm {
             SortingAlgorithm::DebugColor => random_color::set_random_color,
@@ -80,8 +80,8 @@ impl SpanSorter {
             _ => SpanSorter::get_value_function(self.criteria),
         };
         match self.algorithm {
-            // Apply debug color even on every span
-            SortingAlgorithm::DebugColor => sorting_function(pixels, criteria_function),
+            // Apply debug color even on every span (the call is below)
+            SortingAlgorithm::DebugColor => {},
             // Skip sorting a span if it contains less than 2 pixels
             _ => if pixels.len() < 2 {return;},
         }

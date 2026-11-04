@@ -1,6 +1,6 @@
 #![allow(unused_parens, unused)]
 use eframe::egui::TextBuffer;
-use image::{codecs::png::PngEncoder, GenericImageView, ImageResult, Rgb, RgbImage, RgbaImage};
+use image::{codecs::png::PngEncoder, GenericImageView, GrayImage, ImageResult, Rgb, RgbImage, RgbaImage};
 use log::{debug, error, info, warn};
 use path_creator::PathCreator;
 use rayon::prelude::*;
@@ -201,21 +201,40 @@ impl Pixelsorter {
 
     // sorting without creating spans
     pub fn sort_all_pixels(&self, img: &mut RgbImage) {
-        let mut pixels: Vec<&mut Rgb<u8>> = img.pixels_mut().collect();
+        let mut pixels: Vec<Rgb<u8>> = img.pixels().copied().collect();
         self.sorter.sort(&mut pixels);
-    }
-    pub fn sort(&self, img: &mut RgbImage) {
-        let (w, h) = (img.width().into(), img.height().into());
-        self.sort_pixels(img.pixels_mut().collect(), w, h);
+        for (dst, src) in img.pixels_mut().zip(pixels) {
+            *dst = src;
+        }
     }
 
     /// Sort a given image in place
-    pub fn sort_pixels(&self, all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64) {
-        let mut timestart = Instant::now();
-        // a vector containing pointers to each pixel
-        let pixelcount = w * h;
-        info!( "Image information: {} x {} ({} pixels)", w, h, pixelcount);
+    pub fn sort(&self, img: &mut RgbImage) {
+        self.sort_with_mask(img, None);
+    }
 
+    /// Sort a given image in place, but only the pixels where the mask is white (>= 128).
+    /// A mask with a different size than the image is ignored.
+    pub fn sort_with_mask(&self, img: &mut RgbImage, mask: Option<&GrayImage>) {
+        let (w, h) = (img.width(), img.height());
+        let mask = mask
+            .filter(|m| m.width() == w && m.height() == h)
+            .map(|m| m.as_raw().as_slice());
+        let raw: &mut [u8] = img;
+        self.sort_raw(raw, 3, w as u64, h as u64, mask);
+    }
+
+    /// Sort raw pixel data in place.
+    ///
+    /// `channels` is the number of bytes per pixel (3 for RGB, 4 for RGBA). Only the first three
+    /// channels are used and moved, other channels (alpha) stay where they are.
+    /// `mask` has one byte per pixel; only pixels with a value >= 128 are sorted.
+    pub fn sort_raw(&self, raw: &mut [u8], channels: usize, w: u64, h: u64, mask: Option<&[u8]>) {
+        let pixelcount = (w * h) as usize;
+        assert!(channels >= 3, "At least 3 channels per pixel are needed");
+        assert!(raw.len() >= pixelcount * channels, "Pixel buffer is too small for the image size");
+
+        info!("Image information: {} x {} ({} pixels)", w, h, pixelcount);
         info!(
             "Sorting with:\n   | {}{}\n   | {}\n   | {}",
             self.path_creator.info_string(),
@@ -224,35 +243,42 @@ impl Pixelsorter {
             self.sorter.info_string(),
         );
 
-        // CUT IMAGE INTO PATHS
-        timestart = Instant::now();
-        info!("TIME | [Loading pixels]: \t+ {:?}", timestart.elapsed());
-        let ranges = self.path_creator.create_paths(all_pixels, w, h, self.reverse);
-
+        // CUT IMAGE INTO PATHS (lists of pixel indices that never overlap)
+        let mut timestart = Instant::now();
+        let paths = self.path_creator.create_index_paths(w, h, self.reverse, mask);
         info!("TIME [Creating Paths]:\t{:?}", timestart.elapsed());
         timestart = Instant::now();
 
-        // CREATE SPANS ON EVERY PATH
-        let mut spans: Vec<Vec<&mut Rgb<u8>>> = Vec::new();
-        spans.par_extend(
-            ranges
-                .into_par_iter()
-                .map(|r| self.selector.create_spans(&mut r.into()))
-                .flatten(),
-        );
-
-        info!("TIME [Selector]:\t{:?}", timestart.elapsed());
-
-        info!("Amount of spans:\t{}", &spans.len());
-        timestart = Instant::now();
-
-        // SORT EVERY SPAN
-        spans.into_par_iter().for_each(|mut span| {
-            self.sorter.sort(&mut span);
+        // For every path: copy its pixels into a contiguous buffer, select spans,
+        // sort the spans and write the pixels back. This is much more cache friendly
+        // than sorting through pointers that are scattered all over the image.
+        let buffer = SharedPixelBuffer { ptr: raw.as_mut_ptr(), len: raw.len(), channels };
+        let buffer = &buffer;
+        paths.par_iter().for_each(|path| {
+            // SAFETY: the paths are disjoint (every index occurs only once in all paths),
+            // so every pixel is only read and written by the one thread working on its path.
+            let mut pixels: Vec<Rgb<u8>> = path.iter().map(|&i| unsafe { buffer.get(i as usize) }).collect();
+            for (start, end) in self.selector.span_ranges(&pixels) {
+                self.sorter.sort(&mut pixels[start..end]);
+            }
+            for (&i, px) in path.iter().zip(pixels.iter()) {
+                unsafe { buffer.set(i as usize, *px) };
+            }
         });
 
-        let timeend = timestart.elapsed();
-        info!("TIME [Sorting]: \t{:?}", timeend);
+        info!("TIME [Selecting + Sorting]:\t{:?}", timestart.elapsed());
+    }
+
+    /// Sort pixels given as a list of references (in row order)
+    pub fn sort_pixels(&self, mut all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64) {
+        let mut raw: Vec<u8> = Vec::with_capacity(all_pixels.len() * 3);
+        for p in all_pixels.iter() {
+            raw.extend_from_slice(&p.0);
+        }
+        self.sort_raw(&mut raw, 3, w, h, None);
+        for (p, c) in all_pixels.iter_mut().zip(raw.chunks_exact(3)) {
+            p.0.copy_from_slice(c);
+        }
     }
 
     pub fn mask(&self, img: &mut RgbImage) -> bool {
@@ -262,5 +288,40 @@ impl Pixelsorter {
             return true;
         }
         return false;
+    }
+}
+
+/// A raw pointer to pixel data that may be shared between threads.
+/// Only used with disjoint pixel indices per thread (see `Pixelsorter::sort_raw`).
+struct SharedPixelBuffer {
+    ptr: *mut u8,
+    len: usize,
+    channels: usize,
+}
+
+unsafe impl Sync for SharedPixelBuffer {}
+unsafe impl Send for SharedPixelBuffer {}
+
+impl SharedPixelBuffer {
+    /// Reads the RGB values of pixel `i`.
+    /// Safety: no other thread may write pixel `i` at the same time.
+    #[inline]
+    unsafe fn get(&self, i: usize) -> Rgb<u8> {
+        let offset = i * self.channels;
+        assert!(offset + 3 <= self.len);
+        let p = self.ptr.add(offset);
+        Rgb([*p, *p.add(1), *p.add(2)])
+    }
+
+    /// Writes the RGB values of pixel `i` (other channels stay untouched).
+    /// Safety: no other thread may read or write pixel `i` at the same time.
+    #[inline]
+    unsafe fn set(&self, i: usize, px: Rgb<u8>) {
+        let offset = i * self.channels;
+        assert!(offset + 3 <= self.len);
+        let p = self.ptr.add(offset);
+        *p = px.0[0];
+        *p.add(1) = px.0[1];
+        *p.add(2) = px.0[2];
     }
 }

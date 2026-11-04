@@ -1,4 +1,4 @@
-use image::RgbImage;
+use image::{GrayImage, Luma, RgbImage};
 use pixelsortery::Pixelsorter;
 
 use super::PixelsorterValues;
@@ -13,6 +13,9 @@ pub(crate) struct SortingLayer {
     sorting_values: PixelsorterValues,
     sorted_img: RgbImage,
     needs_sorting: bool,
+    /// Painted mask: only pixels where the mask is white (>= 128) get sorted.
+    /// None means the whole image is sorted.
+    paint_mask: Option<GrayImage>,
 }
 
 impl LayeredSorter {
@@ -42,8 +45,49 @@ impl LayeredSorter {
         &self.base_img
     }
     pub(crate) fn set_base_img(&mut self, img: RgbImage) {
+        // Painted masks only fit images with the same size
+        if img.dimensions() != self.base_img.dimensions() {
+            for layer in self.layers.iter_mut() {
+                layer.paint_mask = None;
+            }
+        }
         self.base_img = img;
         self.invalidate_layers_above(0usize, true);
+    }
+
+    /// The painted mask of the current layer (None = the whole image is sorted)
+    pub(crate) fn get_current_paint_mask(&self) -> Option<&GrayImage> {
+        self.get_current_layer().paint_mask.as_ref()
+    }
+
+    /// The painted mask of the current layer. Creates an empty mask (nothing gets sorted) if there is none yet.
+    /// Call `paint_mask_changed` after changing it.
+    pub(crate) fn get_current_paint_mask_mut(&mut self) -> &mut GrayImage {
+        let (w, h) = self.base_img.dimensions();
+        let layer = self.layers.get_mut(self.current_layer).unwrap();
+        // Recreate the mask if it doesn't fit (should not happen)
+        if layer.paint_mask.as_ref().map(|m| m.dimensions() != (w, h)).unwrap_or(true) {
+            layer.paint_mask = Some(GrayImage::new(w, h));
+        }
+        layer.paint_mask.as_mut().unwrap()
+    }
+
+    /// Replace the painted mask of the current layer (None = sort the whole image)
+    pub(crate) fn set_current_paint_mask(&mut self, mask: Option<GrayImage>) {
+        self.layers.get_mut(self.current_layer).unwrap().paint_mask = mask;
+        self.paint_mask_changed();
+    }
+
+    /// Creates a mask with the size of the image, filled with one value (0 = nothing sorted, 255 = everything sorted)
+    pub(crate) fn new_paint_mask(&self, value: u8) -> GrayImage {
+        let (w, h) = self.base_img.dimensions();
+        GrayImage::from_pixel(w, h, Luma([value]))
+    }
+
+    /// Marks the current layer (and all above) as needing a sort, because its mask changed
+    pub(crate) fn paint_mask_changed(&mut self) {
+        self.layers.get_mut(self.current_layer).unwrap().needs_sorting = true;
+        self.invalidate_layers_above(self.current_layer, false);
     }
 
     pub(crate) fn print_state(&self) {
@@ -184,6 +228,7 @@ impl SortingLayer {
             sorting_values: ps,
             sorted_img: img,
             needs_sorting: true,
+            paint_mask: None,
         }
     }
 
@@ -206,9 +251,13 @@ impl SortingLayer {
         &self.sorted_img
     }
 
+    pub(crate) fn has_paint_mask(&self) -> bool {
+        self.paint_mask.is_some()
+    }
+
     fn sort(&mut self, img: &RgbImage) {
         let mut sorted_img = img.clone();
-        self.sorting_values.to_pixelsorter().sort(&mut sorted_img);
+        self.sorting_values.to_pixelsorter().sort_with_mask(&mut sorted_img, self.paint_mask.as_ref());
         self.sorted_img = sorted_img;
         self.needs_sorting = false;
     }
