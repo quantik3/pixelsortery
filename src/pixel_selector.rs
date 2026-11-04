@@ -24,6 +24,11 @@ pub enum PixelSelector {
         max: u64,
         criteria: PixelSelectCriteria,
     },
+    /// Spans end where the color changes a lot between two neighbouring pixels (an edge).
+    /// `threshold` is the allowed difference (sum of the R, G and B differences, 0 - 765).
+    Edges {
+        threshold: u64,
+    },
 }
 
 /// Key criteria which a (Threshold-)Selector should use as a key
@@ -45,6 +50,19 @@ impl PixelSelector {
             PixelSelector::Fixed { len } => fixed_selector(pixels, len),
             PixelSelector::Random { max } => random_selector(pixels, max),
             PixelSelector::Threshold { min, max, criteria } => threshold_selector(pixels, criteria, min, max),
+            PixelSelector::Edges { .. } => {
+                // Find the spans on a copy, then split the pixels accordingly
+                let copy: Vec<Rgb<u8>> = pixels.iter().map(|p| **p).collect();
+                let mut spans = Vec::new();
+                let mut taken = 0;
+                for (start, end) in self.span_ranges(&copy) {
+                    // Skip the pixels between spans (there are none for this selector)
+                    pixels.drain(0..start - taken);
+                    spans.push(pixels.drain(0..end - start).collect());
+                    taken = end;
+                }
+                spans
+            }
         }
     }
     /// Returns the spans of a path as index ranges `(start, end)` (end exclusive).
@@ -119,6 +137,19 @@ impl PixelSelector {
                     ranges.push((s, n));
                 }
             }
+            PixelSelector::Edges { threshold } => {
+                if n == 0 {
+                    return ranges;
+                }
+                let mut start = 0;
+                for i in 1..n {
+                    if color_difference(&pixels[i - 1], &pixels[i]) > threshold {
+                        ranges.push((start, i));
+                        start = i;
+                    }
+                }
+                ranges.push((start, n));
+            }
         }
         ranges
     }
@@ -132,6 +163,7 @@ impl PixelSelector {
                 "Selecting Pixels with: [{} < {:?} < {}]",
                 min, criteria, max
             ),
+            PixelSelector::Edges { threshold } => format!("Spans ending at edges (color difference > {})", threshold),
         }
     }
     pub fn mask(self, pixels: &mut Vec<&mut Rgb<u8>>) -> Result<(), ()> {
@@ -251,3 +283,8 @@ fn threshold_selector<'a>(
     spans
 }
 
+
+/// Sum of the absolute differences of the R, G and B channels (0 - 765)
+fn color_difference(a: &Rgb<u8>, b: &Rgb<u8>) -> u64 {
+    a.0.iter().zip(b.0.iter()).map(|(x, y)| (*x as i64 - *y as i64).unsigned_abs()).sum()
+}

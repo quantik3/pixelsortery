@@ -24,6 +24,10 @@ pub struct Pixelsorter {
     pub selector: PixelSelector,
     pub path_creator: path_creator::PathCreator,
     pub reverse: bool,
+    /// Center for rays, circles and spirals, relative to the image size ((0.5, 0.5) = middle)
+    pub path_center: (f32, f32),
+    /// Reverse the sorting direction of every second span (herringbone pattern)
+    pub alternate: bool,
 }
 
 pub type Span = Vec<Rgb<u8>>;
@@ -36,6 +40,8 @@ impl Pixelsorter {
             selector: PixelSelector::Full,
             path_creator: PathCreator::AllHorizontally,
             reverse: false,
+            path_center: path_creator::DEFAULT_CENTER,
+            alternate: false,
         }
     }
     pub fn to_long_string(&self) -> String {
@@ -62,6 +68,7 @@ impl Pixelsorter {
             PixelSelector::Full => "Full".into(),
             PixelSelector::Fixed { len } => format!("Fixed length ({})", len),
             PixelSelector::Random { max } => format!("Random length ({})", max),
+            PixelSelector::Edges { threshold } => format!("Edges ({})", threshold),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{}{}-{}",
                 match criteria {
@@ -80,12 +87,18 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Shellsort => "Shellsort",
             span_sorter::SortingAlgorithm::Glitchsort => "Glitchsort",
             span_sorter::SortingAlgorithm::DebugColor => "Debug-colors",
+            span_sorter::SortingAlgorithm::Partial => "Partial",
         };
         s += "-";
         s += match self.sorter.criteria {
             SortingCriteria::Hue => "Hue",
             SortingCriteria::Brightness => "Brightness",
             SortingCriteria::Saturation => "Saturation",
+            SortingCriteria::Red => "Red",
+            SortingCriteria::Green => "Green",
+            SortingCriteria::Blue => "Blue",
+            SortingCriteria::Warmth => "Warmth",
+            SortingCriteria::Lightness => "Lightness",
         };
 
         s
@@ -116,6 +129,7 @@ impl Pixelsorter {
             PixelSelector::Full => "Full".into(),
             PixelSelector::Fixed { len } => format!("Fixed ({})", len),
             PixelSelector::Random { max } => format!("Random ({})", max),
+            PixelSelector::Edges { threshold } => format!("Edges ({})", threshold),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{} ({}-{})",
                 match criteria {
@@ -134,12 +148,18 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Shellsort => "Shell",
             span_sorter::SortingAlgorithm::Glitchsort => "Glitch",
             span_sorter::SortingAlgorithm::DebugColor => "Debug",
+            span_sorter::SortingAlgorithm::Partial => "Partial",
         };
         s += "(by ";
         s += match self.sorter.criteria {
             SortingCriteria::Hue => "Hue",
             SortingCriteria::Brightness => "Bright",
             SortingCriteria::Saturation => "Sat",
+            SortingCriteria::Red => "Red",
+            SortingCriteria::Green => "Green",
+            SortingCriteria::Blue => "Blue",
+            SortingCriteria::Warmth => "Warm",
+            SortingCriteria::Lightness => "Light",
         };
         s += ")";
 
@@ -170,6 +190,7 @@ impl Pixelsorter {
             PixelSelector::Full => "full".into(),
             PixelSelector::Fixed { len } => format!("fixed{}", len),
             PixelSelector::Random { max } => format!("rand{}", max),
+            PixelSelector::Edges { threshold } => format!("edges{}", threshold),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{}{}-{}",
                 match criteria {
@@ -188,12 +209,18 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Shellsort => "shell",
             span_sorter::SortingAlgorithm::Glitchsort => "gl",
             span_sorter::SortingAlgorithm::DebugColor => "debug",
+            span_sorter::SortingAlgorithm::Partial => "partial",
         };
         s += "-";
         s += match self.sorter.criteria {
             SortingCriteria::Hue => "hue",
             SortingCriteria::Brightness => "bright",
             SortingCriteria::Saturation => "sat",
+            SortingCriteria::Red => "red",
+            SortingCriteria::Green => "green",
+            SortingCriteria::Blue => "blue",
+            SortingCriteria::Warmth => "warm",
+            SortingCriteria::Lightness => "light",
         };
 
         s
@@ -245,7 +272,7 @@ impl Pixelsorter {
 
         // CUT IMAGE INTO PATHS (lists of pixel indices that never overlap)
         let mut timestart = Instant::now();
-        let paths = self.path_creator.create_index_paths(w, h, self.reverse, mask);
+        let paths = self.path_creator.create_index_paths(w, h, self.reverse, mask, self.path_center);
         info!("TIME [Creating Paths]:\t{:?}", timestart.elapsed());
         timestart = Instant::now();
 
@@ -258,8 +285,13 @@ impl Pixelsorter {
             // SAFETY: the paths are disjoint (every index occurs only once in all paths),
             // so every pixel is only read and written by the one thread working on its path.
             let mut pixels: Vec<Rgb<u8>> = path.iter().map(|&i| unsafe { buffer.get(i as usize) }).collect();
-            for (start, end) in self.selector.span_ranges(&pixels) {
-                self.sorter.sort(&mut pixels[start..end]);
+            for (n, (start, end)) in self.selector.span_ranges(&pixels).into_iter().enumerate() {
+                let span = &mut pixels[start..end];
+                self.sorter.sort(span);
+                // Herringbone: every second span is sorted the other way round
+                if self.alternate && n % 2 == 1 {
+                    span.reverse();
+                }
             }
             for (&i, px) in path.iter().zip(pixels.iter()) {
                 unsafe { buffer.set(i as usize, *px) };

@@ -20,7 +20,12 @@ pub enum PathCreator {
     Diagonally(f32),
     Hilbert,
     X3(i32, i64, f64),
+    /// Wavy lines: (amplitude in pixels, wavelength in pixels, horizontal lines?)
+    Waves(f32, f32, bool),
 }
+
+/// The default center for rays, circles and spirals (relative to the image size)
+pub const DEFAULT_CENTER: (f32, f32) = (0.5, 0.5);
 
 impl std::fmt::Display for PathCreator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +45,12 @@ impl std::fmt::Display for PathCreator {
                 PathCreator::Diagonally(a) => format!("Diagonally ({}°)", a),
                 PathCreator::Hilbert => "Hilbert Curve".into(),
                 PathCreator::X3(_, _, _) => "x³".into(),
+                PathCreator::Waves(a, l, horizontal) => format!(
+                    "Waves {} ({}/{})",
+                    if *horizontal { "→" } else { "↓" },
+                    a,
+                    l
+                ),
             }
         )
     }
@@ -49,16 +60,35 @@ impl PathCreator {
     pub fn info_string(self) -> String {
         format!("Direction/Order: [{:?}]", self)
     }
-    pub fn create_paths(self, all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64, reverse: bool) -> Vec<Vec<&mut Rgb<u8>>> {
 
-        let mut total_timestart = Instant::now();
-        let mut timestart = Instant::now();
+    /// Does this path have a center that can be moved?
+    pub fn uses_center(self) -> bool {
+        matches!(
+            self,
+            PathCreator::Rays | PathCreator::Circles | PathCreator::Spiral | PathCreator::SquareSpiral | PathCreator::RectSpiral
+        )
+    }
 
-        // Actual path algorithms
-        // Ideas/missing:
-        // In waves
-        // In star shape
-        let mut all_paths_indices = match self {
+    /// Creates the raw index paths (may contain invalid or duplicate indices).
+    /// `center` is relative to the image size ((0.5, 0.5) is the middle).
+    fn index_paths(self, w: u64, h: u64, center: (f32, f32)) -> Vec<Vec<u64>> {
+        // The original functions are used for the middle, so old results look exactly the same
+        let custom_center = (center != DEFAULT_CENTER && self.uses_center()).then(|| {
+            (
+                center.0.clamp(0.0, 1.0) as f64 * w as f64,
+                center.1.clamp(0.0, 1.0) as f64 * h as f64,
+            )
+        });
+        if let Some((cx, cy)) = custom_center {
+            return match self {
+                PathCreator::Rays => path_rays_at(w, h, cx as f32, cy as f32),
+                PathCreator::Circles => path_circles_at(w, h, cx, cy),
+                PathCreator::Spiral => path_round_spiral_at(w, h, cx, cy),
+                PathCreator::SquareSpiral => path_rect_spiral_at(w, h, cx, cy, true),
+                _ => path_rect_spiral_at(w, h, cx, cy, false),
+            };
+        }
+        match self {
             PathCreator::AllHorizontally => path_all_horizontally(w, h),
             PathCreator::AllVertically => path_all_vertically(w, h),
             PathCreator::HorizontalLines => path_horizontal_lines(w, h),
@@ -71,7 +101,19 @@ impl PathCreator {
             PathCreator::Spiral => path_round_spiral(w, h),
             PathCreator::Hilbert => gilbert::path_hilbert(w, h),
             PathCreator::X3(offset_y, scalar_w, scalar_l) => path_x3(w, h, offset_y, scalar_w as f64, scalar_l as f64),
-        };
+            PathCreator::Waves(amplitude, wavelength, horizontal) => path_waves(w, h, amplitude, wavelength, horizontal),
+        }
+    }
+    pub fn create_paths(self, all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64, reverse: bool) -> Vec<Vec<&mut Rgb<u8>>> {
+
+        let mut total_timestart = Instant::now();
+        let mut timestart = Instant::now();
+
+        // Actual path algorithms
+        // Ideas/missing:
+        // In waves
+        // In star shape
+        let mut all_paths_indices = self.index_paths(w, h, DEFAULT_CENTER);
         let timeend_pathing = timestart.elapsed();
         timestart = Instant::now();
 
@@ -107,22 +149,9 @@ impl PathCreator {
     /// If a mask is given (one byte per pixel), only pixels with a mask value >= 128 are sorted.
     /// Pixels outside the mask are left untouched and split a path into separate parts,
     /// so no pixel is ever moved across an unmasked area.
-    pub fn create_index_paths(self, w: u64, h: u64, reverse: bool, mask: Option<&[u8]>) -> Vec<Vec<u64>> {
+    pub fn create_index_paths(self, w: u64, h: u64, reverse: bool, mask: Option<&[u8]>, center: (f32, f32)) -> Vec<Vec<u64>> {
         let total_timestart = Instant::now();
-        let mut all_paths_indices = match self {
-            PathCreator::AllHorizontally => path_all_horizontally(w, h),
-            PathCreator::AllVertically => path_all_vertically(w, h),
-            PathCreator::HorizontalLines => path_horizontal_lines(w, h),
-            PathCreator::VerticalLines => path_vertical_lines(w, h),
-            PathCreator::Rays => path_rays(w, h),
-            PathCreator::SquareSpiral => path_rect_spiral(w, h, true),
-            PathCreator::RectSpiral => path_rect_spiral(w, h, false),
-            PathCreator::Diagonally(angle) => path_diagonal_lines(w, h, angle),
-            PathCreator::Circles => path_circles(w, h),
-            PathCreator::Spiral => path_round_spiral(w, h),
-            PathCreator::Hilbert => gilbert::path_hilbert(w, h),
-            PathCreator::X3(offset_y, scalar_w, scalar_l) => path_x3(w, h, offset_y, scalar_w as f64, scalar_l as f64),
-        };
+        let mut all_paths_indices = self.index_paths(w, h, center);
         let timeend_pathing = total_timestart.elapsed();
 
         // Reverse spans if nessesary
@@ -522,4 +551,192 @@ fn path_circles(w: u64, h: u64) -> Vec<Vec<u64>> {
     // THREADING, WOOO
     paths.par_extend((1..max_size / 2).into_par_iter().map(line_path).flatten());
     return paths;
+}
+
+
+/// Wavy lines. Vertical lines (top to bottom) that swing left and right, or horizontal lines
+/// (left to right) that swing up and down. All lines have the same shape, so they never overlap.
+fn path_waves(w: u64, h: u64, amplitude: f32, wavelength: f32, horizontal: bool) -> Vec<Vec<u64>> {
+    let amplitude = amplitude.abs() as f64;
+    let wavelength = (wavelength.abs() as f64).max(1.0);
+    let (along, across) = if horizontal { (w, h) } else { (h, w) };
+    // Offset of the line at every position along it
+    let offsets: Vec<i64> = (0..along)
+        .map(|t| (amplitude * (TWO_PI * t as f64 / wavelength).sin()).round() as i64)
+        .collect();
+    let extra = amplitude.ceil() as i64;
+    (-extra..across as i64 + extra)
+        .into_par_iter()
+        .map(|start| {
+            let mut path = Vec::with_capacity(along as usize);
+            for t in 0..along {
+                let a = start + offsets[t as usize];
+                if a < 0 || a >= across as i64 {
+                    continue;
+                }
+                let (x, y) = if horizontal { (t, a as u64) } else { (a as u64, t) };
+                path.push(y * w + x);
+            }
+            path
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Index of (x, y) if it is inside the image
+fn index_in_bounds(x: f64, y: f64, w: u64, h: u64) -> Option<u64> {
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let (x, y) = (x as u64, y as u64);
+    if x < w && y < h {
+        Some(y * w + x)
+    } else {
+        None
+    }
+}
+
+/// Distance from (cx, cy) to the farthest corner of the image
+fn farthest_corner(w: u64, h: u64, cx: f64, cy: f64) -> f64 {
+    let dx = cx.max(w as f64 - cx);
+    let dy = cy.max(h as f64 - cy);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Rays from a custom center to the border of the image
+fn path_rays_at(w: u64, h: u64, cx: f32, cy: f32) -> Vec<Vec<u64>> {
+    let mut tips: Vec<(f32, f32)> = spread_range(0, w - 1).into_iter().map(|x| (x as f32, 0.0)).collect();
+    tips.extend(spread_range(0, w - 1).into_iter().map(|x| (x as f32, h as f32)));
+    tips.extend(spread_range(0, h - 1).into_iter().map(|y| (0.0, y as f32)));
+    tips.extend(spread_range(0, h - 1).into_iter().map(|y| (w as f32, y as f32)));
+    tips.into_par_iter()
+        .map(|(tx, ty)| {
+            let (dx, dy) = (tx - cx, ty - cy);
+            let m = 2.0 * dx.abs().max(dy.abs());
+            let mut path = Vec::new();
+            if m == 0.0 {
+                return path;
+            }
+            let (dx, dy) = (dx / m, dy / m);
+            let (mut x, mut y) = (cx, cy);
+            loop {
+                if let Some(i) = index_in_bounds(x.round() as f64, y.round() as f64, w, h) {
+                    path.push(i);
+                }
+                x += dx;
+                y += dy;
+                if x < -1.0 || x > w as f32 + 1.0 || y < -1.0 || y > h as f32 + 1.0 {
+                    break;
+                }
+            }
+            path
+        })
+        .collect()
+}
+
+/// Circles around a custom center (each circle is split into a left and a right half)
+fn path_circles_at(w: u64, h: u64, cx: f64, cy: f64) -> Vec<Vec<u64>> {
+    let max_radius = farthest_corner(w, h, cx, cy).ceil() as u64 + 1;
+    let angle_offset = -0.5 * PI;
+    (1..max_radius)
+        .into_par_iter()
+        .map(|r| {
+            let mut path_left = Vec::new();
+            let mut path_right = Vec::new();
+            let step_amounts = 8 * r;
+            let step_size = PI / step_amounts as f64;
+            for step in 0..=step_amounts {
+                let angle = angle_offset + step_size * step as f64;
+                if let Some(i) = index_in_bounds(cx + angle.cos() * r as f64, cy + angle.sin() * r as f64, w, h) {
+                    path_left.push(i);
+                }
+                let angle = angle_offset - step_size * step as f64;
+                if let Some(i) = index_in_bounds(cx + angle.cos() * r as f64, cy + angle.sin() * r as f64, w, h) {
+                    path_right.push(i);
+                }
+            }
+            vec![path_left, path_right]
+        })
+        .flatten()
+        .collect()
+}
+
+/// Connected circles around a custom center
+fn path_round_spiral_at(w: u64, h: u64, cx: f64, cy: f64) -> Vec<Vec<u64>> {
+    let max_radius = farthest_corner(w, h, cx, cy).ceil() as u64 + 1;
+    let angle_offset = -0.5 * PI;
+    let path: Vec<u64> = (1..max_radius)
+        .into_par_iter()
+        .map(|r| {
+            let mut path = Vec::new();
+            let step_amounts = 16 * r;
+            let step_size = 2.0 * PI / step_amounts as f64;
+            for step in 0..=step_amounts {
+                let angle = angle_offset + step_size * step as f64;
+                if let Some(i) = index_in_bounds(cx + angle.cos() * r as f64, cy + angle.sin() * r as f64, w, h) {
+                    path.push(i);
+                }
+            }
+            path
+        })
+        .flatten()
+        .collect();
+    vec![path]
+}
+
+/// A square or rectangular spiral around a custom center
+fn path_rect_spiral_at(w: u64, h: u64, cx: f64, cy: f64, square: bool) -> Vec<Vec<u64>> {
+    let mut x = cx.floor() as i64;
+    let mut y = cy.floor() as i64;
+    let (wi, hi) = (w as i64, h as i64);
+    // The spiral has to reach the farthest corner
+    let max_size = 2 * std::cmp::max(wi, hi) + 2;
+    let mut path = Vec::new();
+    let mut add_pixel_at = |x: i64, y: i64| {
+        if x >= 0 && y >= 0 && x < wi && y < hi {
+            path.push((y * wi + x) as u64);
+        }
+    };
+
+    add_pixel_at(x, y);
+    let mut reach_x = 1;
+    let mut reach_y = 1;
+    if !square {
+        if wi > hi {
+            reach_x = std::cmp::max(1, wi - hi);
+        } else {
+            reach_y = std::cmp::max(1, hi - wi);
+        }
+        x -= reach_x / 2;
+        y -= reach_y / 2;
+    }
+    loop {
+        for _ in 0..reach_x {
+            x += 1;
+            add_pixel_at(x, y);
+        }
+        for _ in 0..reach_y {
+            y += 1;
+            add_pixel_at(x, y);
+        }
+        reach_x += 1;
+        reach_y += 1;
+        if reach_y >= max_size || reach_x >= max_size {
+            break;
+        };
+        for _ in 0..reach_x {
+            x -= 1;
+            add_pixel_at(x, y);
+        }
+        for _ in 0..reach_y {
+            y -= 1;
+            add_pixel_at(x, y);
+        }
+        reach_x += 1;
+        reach_y += 1;
+        if reach_y >= max_size || reach_x >= max_size {
+            break;
+        };
+    }
+    vec![path]
 }

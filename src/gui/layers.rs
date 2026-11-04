@@ -16,6 +16,46 @@ pub(crate) struct SortingLayer {
     /// Painted mask: only pixels where the mask is white (>= 128) get sorted.
     /// None means the whole image is sorted.
     paint_mask: Option<GrayImage>,
+    /// Increased every time the painted mask changes, to detect outdated background results
+    mask_revision: u64,
+}
+
+/// Everything needed to sort some layers in a background thread
+pub(crate) struct SortJob {
+    /// Index of the first layer that gets sorted
+    pub(crate) start: usize,
+    /// The image the first layer is applied to
+    input: RgbImage,
+    /// Sorter and mask for every layer from `start` up to the current layer
+    steps: Vec<(Pixelsorter, Option<GrayImage>)>,
+    /// Values and mask revisions the job was created with
+    checks: Vec<(PixelsorterValues, u64)>,
+}
+
+impl SortJob {
+    /// Sorts all layers of the job one after another. Returns the sorted image of every layer.
+    pub(crate) fn run(self) -> SortJobResult {
+        let mut results = Vec::with_capacity(self.steps.len());
+        let mut img = self.input;
+        for (ps, mask) in &self.steps {
+            ps.sort_with_mask(&mut img, mask.as_ref());
+            results.push(img.clone());
+        }
+        SortJobResult { start: self.start, images: results, checks: self.checks }
+    }
+}
+
+pub(crate) struct SortJobResult {
+    start: usize,
+    images: Vec<RgbImage>,
+    checks: Vec<(PixelsorterValues, u64)>,
+}
+
+impl SortJobResult {
+    /// The sorted image of the last (= the current) layer
+    pub(crate) fn last_image(&self) -> Option<&RgbImage> {
+        self.images.last()
+    }
 }
 
 impl LayeredSorter {
@@ -49,6 +89,7 @@ impl LayeredSorter {
         if img.dimensions() != self.base_img.dimensions() {
             for layer in self.layers.iter_mut() {
                 layer.paint_mask = None;
+                layer.mask_revision += 1;
             }
         }
         self.base_img = img;
@@ -78,6 +119,52 @@ impl LayeredSorter {
         self.paint_mask_changed();
     }
 
+    /// Prepares sorting the current layer (and all layers below that need it) in a background thread.
+    /// Returns None if nothing needs to be sorted (and `force` is false).
+    pub(crate) fn prepare_sort_job(&self, force: bool) -> Option<SortJob> {
+        let current = self.current_layer;
+        let start = self
+            .layers
+            .iter()
+            .take(current + 1)
+            .position(|l| l.needs_sorting)
+            .or(if force { Some(current) } else { None })?;
+        let input = if start == 0 {
+            self.base_img.clone()
+        } else {
+            self.layers[start - 1].sorted_img.clone()
+        };
+        let layers = &self.layers[start..=current];
+        Some(SortJob {
+            start,
+            input,
+            steps: layers
+                .iter()
+                .map(|l| (l.sorting_values.to_pixelsorter(), l.paint_mask.clone()))
+                .collect(),
+            checks: layers.iter().map(|l| (l.sorting_values, l.mask_revision)).collect(),
+        })
+    }
+
+    /// Puts the results of a background sort into the layers.
+    /// Results of layers whose values or mask changed in the meantime are thrown away (and all above).
+    pub(crate) fn apply_sort_result(&mut self, result: SortJobResult) {
+        let start = result.start;
+        let mut applied = 0;
+        for (j, (img, (values, revision))) in result.images.into_iter().zip(result.checks).enumerate() {
+            let Some(layer) = self.layers.get_mut(start + j) else { break };
+            if layer.sorting_values != values || layer.mask_revision != revision {
+                break;
+            }
+            layer.sorted_img = img;
+            layer.needs_sorting = false;
+            applied += 1;
+        }
+        if applied > 0 {
+            self.invalidate_layers_above(start + applied - 1, false);
+        }
+    }
+
     /// Creates a mask with the size of the image, filled with one value (0 = nothing sorted, 255 = everything sorted)
     pub(crate) fn new_paint_mask(&self, value: u8) -> GrayImage {
         let (w, h) = self.base_img.dimensions();
@@ -86,7 +173,9 @@ impl LayeredSorter {
 
     /// Marks the current layer (and all above) as needing a sort, because its mask changed
     pub(crate) fn paint_mask_changed(&mut self) {
-        self.layers.get_mut(self.current_layer).unwrap().needs_sorting = true;
+        let layer = self.layers.get_mut(self.current_layer).unwrap();
+        layer.mask_revision += 1;
+        layer.needs_sorting = true;
         self.invalidate_layers_above(self.current_layer, false);
     }
 
@@ -229,6 +318,7 @@ impl SortingLayer {
             sorted_img: img,
             needs_sorting: true,
             paint_mask: None,
+            mask_revision: 0,
         }
     }
 

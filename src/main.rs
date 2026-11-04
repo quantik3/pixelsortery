@@ -101,6 +101,10 @@ const HELP_STRING: &str = "
    --rays             : Sort from the center in all directions
    --reverse          : Sort in the opposite direction
    --x3               : Sort in a curve
+   --waves <amplitude> <wavelength>   : Sort vertical wavy lines (in pixels)
+   --waves-h <amplitude> <wavelength> : Sort horizontal wavy lines (in pixels)
+   --center <x> <y>   : Center of rays, circles and spirals, relative (0.5 0.5 = middle)
+   --alternate        : Sort every second span in the other direction (herringbone)
 
 ============= Span-Selection Options ============
   [Choose which pixels are valid to form a span]
@@ -108,18 +112,23 @@ const HELP_STRING: &str = "
    --random <max>                        : Sort spans of random length between 0 and <max>
    --fixed  <max>                        : Sort spans of a fixed length <max>
    --thres <hue|bright|sat>:<min>:<max>  : Mark pixels as valid if [hue|bright|sat] is between <min> and <max>
+   --edges <threshold>                   : End spans at edges, where neighbouring colors differ more than <threshold> (0-765)
 
 ============ Sorting Algorithm Options ==========
 
    --mapsort    : Default. O(n)
    --shellsort  : Also cool.
    --glitchsort : Used to create a glitch-like effect
+   --partial <passes> : Only sort partially, pixels move at most <passes> steps
 
 ================ Sorting Options ================
 
    --hue        : Sort Pixels by Hue
    --saturation : Sort Pixels by Saturation
    --brightness : Sort Pixels by Brightness
+   --lightness  : Sort Pixels by perceived lightness (CIE L*)
+   --warmth     : Sort Pixels from cold (blue) to warm (red)
+   --red | --green | --blue : Sort Pixels by one color channel
 
 ==================== Notes ======================
    Options marked with [VIDEO] only work on builds with video support.
@@ -202,6 +211,29 @@ fn main() {
             "--diagonal"   => ps.path_creator = PathCreator::Diagonally(parse_parameter(args.pop_front(), "--diagonal <angle>")),
             "--hilbert"    => ps.path_creator = PathCreator::Hilbert,
             "--x3"         => ps.path_creator = PathCreator::X3(0, 200, 10.0),
+            "--waves" | "--waves-h" => {
+                let usage = "--waves <amplitude> <wavelength>";
+                let amplitude = parse_parameter(args.pop_front(), usage);
+                let wavelength = parse_parameter(args.pop_front(), usage);
+                ps.path_creator = PathCreator::Waves(amplitude, wavelength, arg == "--waves-h");
+            }
+            "--center"     => {
+                let usage = "--center <x> <y>  (relative, 0.5 0.5 = middle)";
+                let x = parse_parameter(args.pop_front(), usage);
+                let y = parse_parameter(args.pop_front(), usage);
+                ps.path_center = (x, y);
+            }
+            "--alternate"  => ps.alternate = true,
+            "--edges"      => ps.selector = PixelSelector::Edges { threshold: parse_parameter(args.pop_front(), "--edges <threshold>") },
+            "--partial"    => {
+                ps.sorter.algorithm = SortingAlgorithm::Partial;
+                ps.sorter.passes = parse_parameter(args.pop_front(), "--partial <passes>");
+            }
+            "--lightness"   => ps.sorter.criteria = SortingCriteria::Lightness,
+            "--warmth"      => ps.sorter.criteria = SortingCriteria::Warmth,
+            "--red"         => ps.sorter.criteria = SortingCriteria::Red,
+            "--green"       => ps.sorter.criteria = SortingCriteria::Green,
+            "--blue"        => ps.sorter.criteria = SortingCriteria::Blue,
             "--reverse"    => do_reverse = true,
 
             "--hue"         => ps.sorter.criteria = SortingCriteria::Hue,

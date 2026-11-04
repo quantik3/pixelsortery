@@ -9,10 +9,10 @@ use egui_flex::{item, Flex, FlexAlign, FlexAlignContent, FlexJustify};
 use egui_video::PlayerState;
 use image::{GrayImage, Pixel, Rgb, RgbImage, RgbaImage};
 use inflections::case::to_title_case;
-use layers::LayeredSorter;
+use layers::{LayeredSorter, SortJobResult};
 use log::{info, warn};
 use pixelsortery::{
-    path_creator::PathCreator,
+    path_creator::{PathCreator, DEFAULT_CENTER},
     pixel_selector::{
         PixelSelectCriteria,
         PixelSelector::{self, *},
@@ -113,6 +113,16 @@ struct PixelsorterGui {
     mask_stroke_changed: bool,
     /// Last brush position in image coordinates
     last_brush_pos: Option<(f32, f32)>,
+    /// The next click on the image sets the center of rays, circles and spirals
+    picking_center: bool,
+    /// Sort in a background thread, so the window stays responsive
+    background_sort: bool,
+    /// The currently running background sort
+    background_job: Option<BackgroundSort>,
+    /// Another sort was requested while one was running (true = forced sort)
+    background_pending: Option<bool>,
+    /// Increased with every sort request; only the result of the newest request is kept
+    sort_generation: u64,
     #[cfg(feature = "video")]
     audio_device: Option<egui_video::AudioDevice>,
     #[cfg(feature = "video")]
@@ -136,9 +146,26 @@ struct PixelsorterValues {
     /// We can select these with the real structs tbh
     path_diagonally_val: f32,
     path_x3: PathCreator,
+    path_waves: PathCreator,
     selector_random: PixelSelector,
     selector_fixed: PixelSelector,
     selector_thres: PixelSelector,
+    selector_edges: PixelSelector,
+    /// Center for rays, circles and spirals (relative to the image size)
+    path_center: (f32, f32),
+    /// Reverse every second span (herringbone)
+    alternate: bool,
+    /// Passes of the partial sort
+    passes: u32,
+}
+
+/// A sort running in a background thread
+struct BackgroundSort {
+    handle: JoinHandle<SortJobResult>,
+    generation: u64,
+    layer_count: usize,
+    current_layer: usize,
+    started: Instant,
 }
 
 #[derive(PartialEq)]
@@ -157,7 +184,10 @@ impl PixelsorterValues {
         ps.selector = self.selector;
         ps.sorter.criteria = self.criteria;
         ps.sorter.algorithm = self.algorithm;
+        ps.sorter.passes = self.passes;
         ps.reverse = self.reverse;
+        ps.path_center = self.path_center;
+        ps.alternate = self.alternate;
         ps
     }
 
@@ -166,10 +196,16 @@ impl PixelsorterValues {
         self.selector = ps.selector;
         self.criteria = ps.sorter.criteria;
         self.algorithm = ps.sorter.algorithm;
+        self.passes = ps.sorter.passes;
         self.reverse = ps.reverse;
+        self.path_center = ps.path_center;
+        self.alternate = ps.alternate;
         // Set the saved value, just in case
         if let PathCreator::Diagonally(a) = self.path {
             self.path_diagonally_val = a;
+        }
+        if let PathCreator::Waves(..) = self.path {
+            self.path_waves = self.path;
         }
         match self.selector {
             Fixed { len } => self.selector_fixed = Fixed { len },
@@ -177,6 +213,7 @@ impl PixelsorterValues {
             Threshold { min, max, criteria } => {
                 self.selector_thres = Threshold { min, max, criteria }
             }
+            Edges { threshold } => self.selector_edges = Edges { threshold },
             Full => warn!("The gui doesn't support the Full-Selector. Just because."),
         }
     }
@@ -203,6 +240,11 @@ impl Default for PixelsorterGui {
 
                 path_diagonally_val: 45.0,
                 path_x3: PathCreator::X3(0, 300, 10.0),
+                path_waves: PathCreator::Waves(20.0, 120.0, false),
+                selector_edges: PixelSelector::Edges { threshold: 80 },
+                path_center: DEFAULT_CENTER,
+                alternate: false,
+                passes: 8,
                 selector_random: PixelSelector::Random { max: 30 },
                 selector_fixed: PixelSelector::Fixed { len: 100 },
                 selector_thres: PixelSelector::Threshold {
@@ -228,6 +270,11 @@ impl Default for PixelsorterGui {
             mask_stroke_active: false,
             mask_stroke_changed: false,
             last_brush_pos: None,
+            picking_center: false,
+            background_sort: true,
+            background_job: None,
+            background_pending: None,
+            sort_generation: 0,
             #[cfg(feature = "video")]
             audio_device: None,
             #[cfg(feature = "video")]
@@ -243,11 +290,7 @@ impl Default for PixelsorterGui {
 impl PixelsorterGui {
     // Given a pixelsorter, return a PixelsorterGui with the values set
     fn with_values(mut self, ps: &Pixelsorter) -> Self {
-        self.values.path = ps.path_creator;
-        self.values.criteria = ps.sorter.criteria;
-        self.values.algorithm = ps.sorter.algorithm;
-        self.values.reverse = ps.reverse;
-        self.values.selector = ps.selector;
+        self.values.read_from_pixelsorter(ps);
         self
     }
     fn with_image(mut self, img: RgbImage, image_path: PathBuf) -> Self {
@@ -256,8 +299,26 @@ impl PixelsorterGui {
         self
     }
 
+    /// Is the threshold mask shown instead of the sorted image?
+    fn showing_threshold_mask(&self) -> bool {
+        self.show_mask
+            && self
+                .layered_sorter
+                .as_ref()
+                .map(|ls| selector_is_threshold(ls.get_current_layer().get_sorting_values().selector))
+                .unwrap_or(false)
+    }
+
     /// Calls sort_current_layer, sets the image and texture
     fn sort_img(&mut self, ctx: &egui::Context, force: bool) {
+        if self.background_sort && self.layered_sorter.is_some() && !self.showing_threshold_mask() {
+            // The image and texture are set when the result arrives
+            self.request_background_sort(ctx, force);
+            return;
+        }
+        // Results of a background sort that is still running are outdated now
+        self.sort_generation += 1;
+        self.background_pending = None;
         if let Some(ls) = &mut self.layered_sorter {
             // values.selector is not up-to-date with the current layer as it seems
             if selector_is_threshold(ls.get_current_layer().get_sorting_values().selector)
@@ -284,6 +345,106 @@ impl PixelsorterGui {
         self.update_texture(ctx);
     }
 
+    /// Sorts in a background thread. If a sort is already running, the new one starts after it finished.
+    fn request_background_sort(&mut self, ctx: &egui::Context, force: bool) {
+        self.sort_generation += 1;
+        if self.background_job.is_some() {
+            self.background_pending = Some(self.background_pending.unwrap_or(false) || force);
+        } else {
+            self.start_background_sort(ctx, force);
+        }
+    }
+
+    fn start_background_sort(&mut self, ctx: &egui::Context, force: bool) {
+        let Some(ls) = &self.layered_sorter else { return };
+        match ls.prepare_sort_job(force) {
+            None => {
+                // Everything is sorted already, just show it
+                self.img = Some(ls.get_current_layer().get_img().clone());
+                self.update_texture(ctx);
+            }
+            Some(job) => {
+                let repaint_ctx = ctx.clone();
+                let handle = std::thread::spawn(move || {
+                    let result = job.run();
+                    // Wake up the gui to pick up the result
+                    repaint_ctx.request_repaint();
+                    result
+                });
+                self.background_job = Some(BackgroundSort {
+                    handle,
+                    generation: self.sort_generation,
+                    layer_count: ls.get_layers().len(),
+                    current_layer: ls.get_current_index(),
+                    started: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// Checks if the background sort finished, shows and stores its result and starts the next one if requested
+    fn poll_background_sort(&mut self, ctx: &egui::Context) {
+        let finished = match &self.background_job {
+            None => return,
+            Some(job) => job.handle.is_finished(),
+        };
+        if !finished {
+            // In case the wake up from the thread gets lost
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        let job = self.background_job.take().unwrap();
+        let elapsed = job.started.elapsed();
+        let is_newest = job.generation == self.sort_generation;
+        let more_coming = self.background_pending.is_some();
+        let show_result = !self.show_base_image && !self.showing_threshold_mask();
+
+        match job.handle.join() {
+            Ok(result) => {
+                if let Some(ls) = &mut self.layered_sorter {
+                    let same_layers = ls.get_layers().len() == job.layer_count
+                        && ls.get_current_index() == job.current_layer;
+                    if same_layers {
+                        // Show the result, even if it is a bit outdated and a newer sort is coming
+                        if show_result && (is_newest || more_coming) {
+                            if let Some(img) = result.last_image() {
+                                self.img = Some(img.clone());
+                            }
+                        }
+                        // Only keep the newest result
+                        if is_newest {
+                            ls.apply_sort_result(result);
+                        }
+                        *self.time_last_sort.lock().unwrap() = elapsed;
+                    }
+                }
+                if show_result {
+                    self.update_texture(ctx);
+                }
+            }
+            Err(_) => warn!("Sorting in the background failed"),
+        }
+
+        if let Some(force) = self.background_pending.take() {
+            self.start_background_sort(ctx, force);
+        }
+    }
+
+    /// The image that should be saved. Makes sure the current layer is completely sorted.
+    fn image_for_saving(&mut self) -> Option<RgbImage> {
+        if self.show_base_image || self.showing_threshold_mask() {
+            return self.img.clone();
+        }
+        match &mut self.layered_sorter {
+            Some(ls) => {
+                // A background sort might not be finished yet
+                ls.sort_current_layer_cached();
+                Some(ls.get_current_layer().get_img().clone())
+            }
+            None => self.img.clone(),
+        }
+    }
+
     /// Update texture
     fn update_texture(&mut self, ctx: &egui::Context) {
         if let Some(img) = &self.img {
@@ -302,10 +463,20 @@ impl PixelsorterGui {
 
     /// Tries to show the image if it exists
     fn show_img(&mut self, ui: &mut Ui) {
-        let painting = self.mask_edit && self.layered_sorter.is_some();
+        let picking = self.picking_center && self.layered_sorter.is_some() && self.values.path.uses_center();
+        if !picking {
+            self.picking_center = false;
+        }
+        let painting = !picking && self.mask_edit && self.layered_sorter.is_some();
         if let Some(tex) = &self.texture {
             let (tex_id, tex_size) = (tex.id(), tex.size_vec2());
-            let sense = if painting { Sense::click_and_drag() } else { Sense::hover() };
+            let sense = if picking {
+                Sense::click()
+            } else if painting {
+                Sense::click_and_drag()
+            } else {
+                Sense::hover()
+            };
             let response = egui::Frame::group(ui.style_mut())
                 .inner_margin(0)
                 .show(ui, |ui| {
@@ -314,6 +485,9 @@ impl PixelsorterGui {
                 .inner;
             if painting {
                 self.mask_painting(ui, &response);
+            }
+            if picking {
+                self.center_picking(ui, &response);
             }
         }
         if !painting {
@@ -423,6 +597,45 @@ impl PixelsorterGui {
         }
     }
 
+    /// Sets the center of rays, circles and spirals with a click on the image
+    fn center_picking(&mut self, ui: &mut Ui, response: &Response) {
+        let rect = response.rect;
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let painter = ui.painter();
+        // Crosshair at the mouse
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+            if rect.contains(p) {
+                let stroke = Stroke::new(1.0, Color32::YELLOW);
+                painter.line_segment([pos2(rect.min.x, p.y), pos2(rect.max.x, p.y)], stroke);
+                painter.line_segment([pos2(p.x, rect.min.y), pos2(p.x, rect.max.y)], stroke);
+            }
+        }
+        // The current center
+        let (cx, cy) = self.values.path_center;
+        let current = pos2(rect.min.x + cx * rect.width(), rect.min.y + cy * rect.height());
+        painter.circle_stroke(current, 6.0, Stroke::new(2.0, Color32::YELLOW));
+
+        if response.clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.values.path_center = (
+                    ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
+                    ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
+                );
+                // The values are read back from the layer every frame, so write them there
+                if let Some(ls) = &mut self.layered_sorter {
+                    ls.update_current(self.values);
+                }
+                self.picking_center = false;
+                if self.auto_sort {
+                    self.do_sort = true;
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
     /// Sorts again after a finished brush stroke
     fn finish_mask_stroke(&mut self, ctx: &egui::Context) {
         if self.mask_stroke_changed {
@@ -468,6 +681,9 @@ impl PixelsorterGui {
                             ls.set_base_img(img.clone());
                         }
                         self.mask_texture_dirty = true;
+                        // Results of a running background sort belong to the old image
+                        self.sort_generation += 1;
+                        self.background_pending = None;
                         // I want to make layered_sorter mandatory and remove the possibility of it being None
                         #[cfg(feature = "video")] {
                             self.video_player = None;
@@ -529,7 +745,7 @@ impl PixelsorterGui {
                 } else {
                     outpath.set_file_name(filename);
                 }
-                if let Some(sorted) = &self.img {
+                if let Some(sorted) = &self.image_for_saving() {
                     if let Ok(p) = save_image(sorted, &outpath) {
                         info!("Saved file to '{}' ...", p.to_string_lossy());
                         self.saving_success_timeout = Some(Instant::now());
@@ -544,7 +760,7 @@ impl PixelsorterGui {
     /// Sorts and saves the current image to a location via a file picker
     fn save_file_as(&mut self) {
         let path = &self.path.clone();
-        if let Some(img) = &self.img {
+        if let Some(img) = &self.image_for_saving() {
             if save_image_as(img, path.as_deref()).is_ok(){
                 self.saving_success_timeout = Some(Instant::now());
             };
@@ -635,6 +851,9 @@ impl eframe::App for PixelsorterGui {
             }
         }
 
+        // Pick up results of the background sort
+        self.poll_background_sort(ctx);
+
         // UI //
 
         #[cfg(feature = "video")]
@@ -681,6 +900,11 @@ impl eframe::App for PixelsorterGui {
                     "({:.3} fps)",
                     (1.0 / tls.as_secs_f32())
                 ));
+                if self.background_job.is_some() {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label("Sorting...");
+                }
                 ui.separator();
                 if let Some(inst) = self.saving_success_timeout {
                     if inst.elapsed() > Duration::from_secs_f32(SAVED_LABEL_VANISH_TIMEOUT) {
@@ -753,8 +977,10 @@ impl eframe::App for PixelsorterGui {
                         // SORT IMAGE button
                         ui.columns(3, |columns| {
                             let ui = &mut columns[0];
-                            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            ui.with_layout(Layout::top_down(Align::Max), |ui| {
                                 ui.checkbox(&mut self.auto_sort, "Auto-sort");
+                                ui.checkbox(&mut self.background_sort, "Background")
+                                    .on_hover_text("Sort in a background thread: the window stays responsive while sorting");
                             });
                             let ui = &mut columns[1];
                             ui.with_layout(Layout::top_down(Align::Center), |ui| {

@@ -37,6 +37,7 @@ impl PixelsorterGui {
             PathCreator::Diagonally(self.values.path_diagonally_val),
             PathCreator::Hilbert,
             self.values.path_x3.clone(),
+            self.values.path_waves.clone(),
         ];
         let selected_text = self.values.path.to_string();
 
@@ -114,8 +115,76 @@ impl PixelsorterGui {
                     });
                 ui.end_row();
             }
+            PathCreator::Waves(ref mut amplitude, ref mut wavelength, ref mut horizontal) => {
+                ui.label("");
+                egui::Grid::new(format!("path_options_grid_{}", id))
+                    .num_columns(2)
+                    .min_row_height(25.0)
+                    .show(ui, |ui| {
+                        ui.label(important_text("Amplitude"));
+                        ui.add(
+                            egui::Slider::new(amplitude, 0.0..=500.0)
+                                .logarithmic(true)
+                                .clamping(SliderClamping::Never)
+                                .max_decimals(1)
+                                .suffix(" px"),
+                        );
+                        ui.end_row();
+                        ui.label(important_text("Wavelength"));
+                        ui.add(
+                            egui::Slider::new(wavelength, 2.0..=3000.0)
+                                .logarithmic(true)
+                                .clamping(SliderClamping::Never)
+                                .max_decimals(1)
+                                .suffix(" px"),
+                        );
+                        ui.end_row();
+                        ui.label(important_text("Direction"));
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(horizontal, false, "Vertical");
+                            ui.selectable_value(horizontal, true, "Horizontal");
+                        });
+                        ui.end_row();
+                    });
+                ui.end_row();
+            }
             _ => {}
         };
+        // Remember the wave settings for when we reselect waves
+        if let PathCreator::Waves(..) = self.values.path {
+            self.values.path_waves = self.values.path;
+        }
+
+        // Center of rays, circles and spirals
+        if self.values.path.uses_center() {
+            ui.label("");
+            egui::Grid::new(format!("path_center_grid_{}", id))
+                .num_columns(2)
+                .min_row_height(25.0)
+                .show(ui, |ui| {
+                    ui.label(important_text("Center X"));
+                    ui.add(egui::Slider::new(&mut self.values.path_center.0, 0.0..=1.0).fixed_decimals(2));
+                    ui.end_row();
+                    ui.label(important_text("Center Y"));
+                    ui.add(egui::Slider::new(&mut self.values.path_center.1, 0.0..=1.0).fixed_decimals(2));
+                    ui.end_row();
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(Button::new("Pick on image").selected(self.picking_center))
+                            .on_hover_text("Click on the image to set the center")
+                            .clicked()
+                        {
+                            self.picking_center = !self.picking_center;
+                        }
+                        if ui.button("Reset").clicked() {
+                            self.values.path_center = DEFAULT_CENTER;
+                        }
+                    });
+                    ui.end_row();
+                });
+            ui.end_row();
+        }
     }
 
     pub(super) fn selector_combo_box(&mut self, ui: &mut Ui, id: u64) {
@@ -125,6 +194,7 @@ impl PixelsorterGui {
                 (self.values.selector_fixed, "Fixed"),
                 (self.values.selector_random, "Random"),
                 (self.values.selector_thres, "Threshold"),
+                (self.values.selector_edges, "Edges"),
             ] {
                 ui.selectable_value(&mut self.values.selector, s, n);
             }
@@ -246,6 +316,18 @@ impl PixelsorterGui {
                         // Save selector state
                         self.values.selector_thres = self.values.selector;
                     }
+                    PixelSelector::Edges { threshold } => {
+                        ui.label(important_text("Edge"));
+                        let slider = egui::Slider::new(threshold, 0..=765)
+                            .clamping(SliderClamping::Never)
+                            .drag_value_speed(0.5)
+                            .smart_aim(false);
+                        ui.add(slider)
+                            .on_hover_text("A span ends where neighbouring pixels differ more than this. Lower = shorter spans, objects stay visible");
+                        ui.end_row();
+                        // Save selector state
+                        self.values.selector_edges = self.values.selector;
+                    }
                     // We don't expose the Full Selector to the gui, so I don't wanna support it
                     PixelSelector::Full => {
                         self.values.selector = PixelsorterGui::default().values.selector
@@ -256,17 +338,24 @@ impl PixelsorterGui {
     }
 
     pub(super) fn criteria_combo_box(&mut self, ui: &mut Ui, id: u64) {
-        ui.horizontal(|ui| {
-            vec![
-                SortingCriteria::Brightness,
-                SortingCriteria::Saturation,
-                SortingCriteria::Hue,
-            ]
-            .into_iter()
-            .for_each(|c| {
-                ui.selectable_value(&mut self.values.criteria, c, format!("{:?}", c));
+        egui::ComboBox::from_id_salt(format!("criteria_combo_{}", id))
+            .selected_text(format!("{:?}", self.values.criteria))
+            .show_ui(ui, |ui| {
+                vec![
+                    SortingCriteria::Brightness,
+                    SortingCriteria::Lightness,
+                    SortingCriteria::Saturation,
+                    SortingCriteria::Hue,
+                    SortingCriteria::Warmth,
+                    SortingCriteria::Red,
+                    SortingCriteria::Green,
+                    SortingCriteria::Blue,
+                ]
+                .into_iter()
+                .for_each(|c| {
+                    ui.selectable_value(&mut self.values.criteria, c, format!("{:?}", c));
+                });
             });
-        });
     }
 
     pub(super) fn algorithmn_combo_box(&mut self, ui: &mut Ui, id: u64) {
@@ -277,6 +366,7 @@ impl PixelsorterGui {
                     SortingAlgorithm::Mapsort,
                     SortingAlgorithm::Shellsort,
                     SortingAlgorithm::Glitchsort,
+                    SortingAlgorithm::Partial,
                     SortingAlgorithm::DebugColor,
                 ]
                 .into_iter()
@@ -316,12 +406,27 @@ impl PixelsorterGui {
                 ui.label(important_text("Algorithm"));
                 self.algorithmn_combo_box(ui, id);
                 ui.end_row();
+                if self.values.algorithm == SortingAlgorithm::Partial {
+                    ui.label(important_text("Passes"));
+                    ui.add(
+                        egui::Slider::new(&mut self.values.passes, 1..=1000)
+                            .logarithmic(true)
+                            .clamping(SliderClamping::Never),
+                    )
+                    .on_hover_text("How far pixels move towards their place. Few passes = dripping look");
+                    ui.end_row();
+                }
                 // SORTING CRITERIA
                 ui.label(important_text("Criteria"));
                 ui.horizontal(|ui| {
                     ui.label("by");
                     self.criteria_combo_box(ui, id);
                 });
+                ui.end_row();
+                // PATTERN
+                ui.label(important_text("Pattern"));
+                ui.checkbox(&mut self.values.alternate, "Alternate direction")
+                    .on_hover_text("Every second span is sorted the other way round (herringbone)");
                 ui.end_row();
             });
     }
