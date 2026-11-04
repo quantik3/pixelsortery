@@ -14,8 +14,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Сборка FFmpeg с dev-файлами (include + lib) и DLL. ffmpeg-the-third 6.0 поддерживает FFmpeg до 9.0.
-  FFMPEG_ZIP: ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+  # Сборка FFmpeg с dev-файлами (include + lib) и DLL - так же, как в CI самого ffmpeg-the-third.
+  # ffmpeg-the-third 6.0 поддерживает FFmpeg до 9.0.
+  FFMPEG_VERSION: "9.0"
+  FFMPEG_DOWNLOAD_URL: "https://github.com/GyanD/codexffmpeg/releases/download/VER/ffmpeg-VER-full_build-shared.7z"
+  FFMPEG_INSTALL_PATH: "C:/ffmpeg"
   VIDEO: ${{ inputs.no_video && 'false' || 'true' }}
 
 jobs:
@@ -31,20 +34,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-cargo-video-${{ env.VIDEO }}-${{ hashFiles('**/Cargo.lock') }}
+          key: windows-cargo-v2-video-${{ env.VIDEO }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # libclang из комплекта Visual Studio: с отдельно установленным LLVM build-скрипт
+      # ffmpeg-sys-the-third падает с STATUS_ACCESS_VIOLATION
+      - name: Set libclang path
+        if: env.VIDEO == 'true'
+        shell: pwsh
+        run: |
+          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
 
       - name: Download FFmpeg
         if: env.VIDEO == 'true'
         shell: pwsh
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$env:FFMPEG_ZIP.zip"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath C:\
-          $dir = "C:\$env:FFMPEG_ZIP"
-          Get-ChildItem $dir
-          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $tempFile = New-TemporaryFile
+          $uri = ($env:FFMPEG_DOWNLOAD_URL).Replace('VER', $env:FFMPEG_VERSION)
+          Invoke-WebRequest "$uri" -OutFile "$tempFile"
+          7z x -y -o"$env:FFMPEG_INSTALL_PATH" "$tempFile"
+          $ffmpegDir = (Get-ChildItem -Directory "$env:FFMPEG_INSTALL_PATH").FullName
+          Get-ChildItem $ffmpegDir
+          Add-Content $env:GITHUB_ENV "FFMPEG_DIR=$ffmpegDir"
+          Add-Content $env:GITHUB_PATH "$ffmpegDir\bin"
 
       - name: Build
         shell: bash
