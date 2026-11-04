@@ -1,0 +1,73 @@
+# Сборка Windows-версии: при пуше в main или вручную (Actions -> Build Windows -> Run workflow).
+# Результат - zip в разделе Artifacts у запуска: pixelsortery.exe + DLL FFmpeg (держать в одной папке).
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      no_video:
+        description: "Собрать БЕЗ поддержки видео (быстрее, без DLL FFmpeg)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Сборка FFmpeg с dev-файлами (include + lib) и DLL. ffmpeg-the-third 6.0 поддерживает FFmpeg до 9.0.
+  FFMPEG_ZIP: ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+  VIDEO: ${{ inputs.no_video && 'false' || 'true' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-video-${{ env.VIDEO }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download FFmpeg
+        if: env.VIDEO == 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$env:FFMPEG_ZIP.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath C:\
+          $dir = "C:\$env:FFMPEG_ZIP"
+          Get-ChildItem $dir
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "$VIDEO" == "true" ]]; then
+            cargo build --release --features video
+          else
+            cargo build --release
+          fi
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\pixelsortery.exe dist\
+          if ($env:VIDEO -eq 'true') {
+            Copy-Item "$env:FFMPEG_DIR\bin\*.dll" dist\
+            Copy-Item "$env:FFMPEG_DIR\bin\ffplay.exe" dist\ -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelsortery-windows${{ env.VIDEO == 'true' && '-video' || '' }}-${{ github.sha }}
+          path: dist/
+          retention-days: 30
