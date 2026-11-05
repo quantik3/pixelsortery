@@ -125,6 +125,8 @@ impl PixelsorterGui {
                         ui.add(
                             egui::Slider::new(amplitude, 0.0..=500.0)
                                 .logarithmic(true)
+                                // Without this, half of the slider is filled with values below 1 px
+                                .smallest_positive(1.0)
                                 .clamping(SliderClamping::Never)
                                 .max_decimals(1)
                                 .suffix(" px"),

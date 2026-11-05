@@ -47,7 +47,7 @@ impl std::fmt::Display for PathCreator {
                 PathCreator::X3(_, _, _) => "x³".into(),
                 PathCreator::Waves(a, l, horizontal) => format!(
                     "Waves {} ({}/{})",
-                    if *horizontal { "→" } else { "↓" },
+                    if *horizontal { "horizontal" } else { "vertical" },
                     a,
                     l
                 ),
