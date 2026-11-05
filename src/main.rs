@@ -105,6 +105,8 @@ const HELP_STRING: &str = "
    --waves-h <amplitude> <wavelength> : Sort horizontal wavy lines (in pixels)
    --center <x> <y>   : Center of rays, circles and spirals, relative (0.5 0.5 = middle)
    --alternate        : Sort every second span in the other direction (herringbone)
+   --flow <size> <seed>        : Sort along a swirling flow field (size of the swirls in pixels)
+   --star <points> <inner>     : Sort in star shaped rings around the center (inner radius 0-1)
 
 ============= Span-Selection Options ============
   [Choose which pixels are valid to form a span]
@@ -120,6 +122,8 @@ const HELP_STRING: &str = "
    --shellsort  : Also cool.
    --glitchsort : Used to create a glitch-like effect
    --partial <passes> : Only sort partially, pixels move at most <passes> steps
+   --stretch <amount> : Don't sort, stretch the beginning of each span over it (0-1)
+   --shift <amount>   : Don't sort, shift each span by a random amount (0-1)
 
 ================ Sorting Options ================
 
@@ -129,6 +133,9 @@ const HELP_STRING: &str = "
    --lightness  : Sort Pixels by perceived lightness (CIE L*)
    --warmth     : Sort Pixels from cold (blue) to warm (red)
    --red | --green | --blue : Sort Pixels by one color channel
+   --guide <FILE>  : Sort Pixels by the brightness of another image at their position
+   --channel <r|g|b> : Only move one color channel, the others stay in place
+   --posterize <levels> : Reduce the sorted colors to <levels> per channel
 
 ==================== Notes ======================
    Options marked with [VIDEO] only work on builds with video support.
@@ -167,6 +174,7 @@ fn main() {
     let mut do_reverse = false;
     let mut show_mask = false;
     let mut paint_mask_path: Option<String> = None;
+    let mut guide_path: Option<String> = None;
     let mut start_gui = false;
 
     #[cfg(feature = "video")]
@@ -224,6 +232,42 @@ fn main() {
                 ps.path_center = (x, y);
             }
             "--alternate"  => ps.alternate = true,
+            "--flow" => {
+                let usage = "--flow <size> <seed>";
+                let size = parse_parameter(args.pop_front(), usage);
+                let seed = parse_parameter(args.pop_front(), usage);
+                ps.path_creator = PathCreator::FlowField(size, seed);
+            }
+            "--star" => {
+                let usage = "--star <points> <inner>";
+                let points = parse_parameter(args.pop_front(), usage);
+                let inner = parse_parameter(args.pop_front(), usage);
+                ps.path_creator = PathCreator::Star(points, inner);
+            }
+            "--stretch" => {
+                ps.sorter.algorithm = SortingAlgorithm::Stretch;
+                ps.sorter.amount = parse_parameter(args.pop_front(), "--stretch <amount>");
+            }
+            "--shift" => {
+                ps.sorter.algorithm = SortingAlgorithm::Shift;
+                ps.sorter.amount = parse_parameter(args.pop_front(), "--shift <amount>");
+            }
+            "--guide" => {
+                guide_path = Some(parse_parameter::<String>(args.pop_front(), "--guide <FILE>"));
+                ps.sorter.criteria = SortingCriteria::Guide;
+            }
+            "--channel" => {
+                ps.channels = match parse_parameter::<String>(args.pop_front(), "--channel <r|g|b>").as_str() {
+                    "r" | "red" => pixelsortery::ChannelMode::Red,
+                    "g" | "green" => pixelsortery::ChannelMode::Green,
+                    "b" | "blue" => pixelsortery::ChannelMode::Blue,
+                    other => {
+                        eprintln!("Unknown channel '{}', use r, g or b", other);
+                        exit(-1);
+                    }
+                }
+            }
+            "--posterize" => ps.posterize = parse_parameter(args.pop_front(), "--posterize <levels>"),
             "--edges"      => ps.selector = PixelSelector::Edges { threshold: parse_parameter(args.pop_front(), "--edges <threshold>") },
             "--partial"    => {
                 ps.sorter.algorithm = SortingAlgorithm::Partial;
@@ -374,8 +418,18 @@ fn main() {
                 }
             }
         });
+        // Load the guide image, if given (resized to the image size)
+        let guide = guide_path.map(|path| match image::open(&path) {
+            Ok(g) => g
+                .resize_exact(img.width(), img.height(), image::imageops::FilterType::Triangle)
+                .into_luma8(),
+            Err(e) => {
+                eprintln!("[ERROR] Could not open guide image '{}': {}", path, e);
+                exit(-1);
+            }
+        });
         // SORTING
-        ps.sort_with_mask(&mut img, paint_mask.as_ref());
+        ps.sort_with_mask_and_guide(&mut img, paint_mask.as_ref(), guide.as_ref());
     }
 
     let duration = start.elapsed();

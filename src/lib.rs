@@ -28,6 +28,31 @@ pub struct Pixelsorter {
     pub path_center: (f32, f32),
     /// Reverse the sorting direction of every second span (herringbone pattern)
     pub alternate: bool,
+    /// Which color channels are moved (the others stay where they are)
+    pub channels: ChannelMode,
+    /// Reduce the colors of the sorted pixels to this many levels per channel (0 or 1 = off)
+    pub posterize: u8,
+}
+
+/// Which color channels of the pixels are moved by the sorting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelMode {
+    All,
+    Red,
+    Green,
+    Blue,
+}
+
+impl ChannelMode {
+    /// Index of the only channel that is written, or None for all channels
+    fn single_channel(self) -> Option<usize> {
+        match self {
+            ChannelMode::All => None,
+            ChannelMode::Red => Some(0),
+            ChannelMode::Green => Some(1),
+            ChannelMode::Blue => Some(2),
+        }
+    }
 }
 
 pub type Span = Vec<Rgb<u8>>;
@@ -42,6 +67,8 @@ impl Pixelsorter {
             reverse: false,
             path_center: path_creator::DEFAULT_CENTER,
             alternate: false,
+            channels: ChannelMode::All,
+            posterize: 0,
         }
     }
     pub fn to_long_string(&self) -> String {
@@ -88,6 +115,8 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Glitchsort => "Glitchsort",
             span_sorter::SortingAlgorithm::DebugColor => "Debug-colors",
             span_sorter::SortingAlgorithm::Partial => "Partial",
+            span_sorter::SortingAlgorithm::Stretch => "Stretch",
+            span_sorter::SortingAlgorithm::Shift => "Shift",
         };
         s += "-";
         s += match self.sorter.criteria {
@@ -99,6 +128,7 @@ impl Pixelsorter {
             SortingCriteria::Blue => "Blue",
             SortingCriteria::Warmth => "Warmth",
             SortingCriteria::Lightness => "Lightness",
+            SortingCriteria::Guide => "Guide",
         };
 
         s
@@ -149,6 +179,8 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Glitchsort => "Glitch",
             span_sorter::SortingAlgorithm::DebugColor => "Debug",
             span_sorter::SortingAlgorithm::Partial => "Partial",
+            span_sorter::SortingAlgorithm::Stretch => "Stretch",
+            span_sorter::SortingAlgorithm::Shift => "Shift",
         };
         s += "(by ";
         s += match self.sorter.criteria {
@@ -160,6 +192,7 @@ impl Pixelsorter {
             SortingCriteria::Blue => "Blue",
             SortingCriteria::Warmth => "Warm",
             SortingCriteria::Lightness => "Light",
+            SortingCriteria::Guide => "Guide",
         };
         s += ")";
 
@@ -210,6 +243,8 @@ impl Pixelsorter {
             span_sorter::SortingAlgorithm::Glitchsort => "gl",
             span_sorter::SortingAlgorithm::DebugColor => "debug",
             span_sorter::SortingAlgorithm::Partial => "partial",
+            span_sorter::SortingAlgorithm::Stretch => "stretch",
+            span_sorter::SortingAlgorithm::Shift => "shift",
         };
         s += "-";
         s += match self.sorter.criteria {
@@ -221,6 +256,7 @@ impl Pixelsorter {
             SortingCriteria::Blue => "blue",
             SortingCriteria::Warmth => "warm",
             SortingCriteria::Lightness => "light",
+            SortingCriteria::Guide => "guide",
         };
 
         s
@@ -243,12 +279,19 @@ impl Pixelsorter {
     /// Sort a given image in place, but only the pixels where the mask is white (>= 128).
     /// A mask with a different size than the image is ignored.
     pub fn sort_with_mask(&self, img: &mut RgbImage, mask: Option<&GrayImage>) {
+        self.sort_with_mask_and_guide(img, mask, None);
+    }
+
+    /// Like `sort_with_mask`, with an optional guide image: when sorting by the criteria `Guide`,
+    /// the pixels are sorted by the brightness of the guide image at their position.
+    /// Mask and guide are ignored if their size differs from the image.
+    pub fn sort_with_mask_and_guide(&self, img: &mut RgbImage, mask: Option<&GrayImage>, guide: Option<&GrayImage>) {
         let (w, h) = (img.width(), img.height());
-        let mask = mask
-            .filter(|m| m.width() == w && m.height() == h)
-            .map(|m| m.as_raw().as_slice());
+        let fits = |m: &&GrayImage| m.width() == w && m.height() == h;
+        let mask = mask.filter(fits).map(|m| m.as_raw().as_slice());
+        let guide = guide.filter(fits).map(|m| m.as_raw().as_slice());
         let raw: &mut [u8] = img;
-        self.sort_raw(raw, 3, w as u64, h as u64, mask);
+        self.sort_raw_with_guide(raw, 3, w as u64, h as u64, mask, guide);
     }
 
     /// Sort raw pixel data in place.
@@ -257,7 +300,15 @@ impl Pixelsorter {
     /// channels are used and moved, other channels (alpha) stay where they are.
     /// `mask` has one byte per pixel; only pixels with a value >= 128 are sorted.
     pub fn sort_raw(&self, raw: &mut [u8], channels: usize, w: u64, h: u64, mask: Option<&[u8]>) {
+        self.sort_raw_with_guide(raw, channels, w, h, mask, None);
+    }
+
+    /// Like `sort_raw`, with an optional guide (one brightness byte per pixel), see `sort_with_mask_and_guide`.
+    pub fn sort_raw_with_guide(&self, raw: &mut [u8], channels: usize, w: u64, h: u64, mask: Option<&[u8]>, guide: Option<&[u8]>) {
         let pixelcount = (w * h) as usize;
+        let guide = guide.filter(|g| g.len() >= pixelcount && self.sorter.criteria == SortingCriteria::Guide);
+        let single_channel = self.channels.single_channel();
+        let posterize_levels = self.posterize;
         assert!(channels >= 3, "At least 3 channels per pixel are needed");
         assert!(raw.len() >= pixelcount * channels, "Pixel buffer is too small for the image size");
 
@@ -285,16 +336,30 @@ impl Pixelsorter {
             // SAFETY: the paths are disjoint (every index occurs only once in all paths),
             // so every pixel is only read and written by the one thread working on its path.
             let mut pixels: Vec<Rgb<u8>> = path.iter().map(|&i| unsafe { buffer.get(i as usize) }).collect();
-            for (n, (start, end)) in self.selector.span_ranges(&pixels).into_iter().enumerate() {
+            // The spans are selected on the original colors
+            let ranges = self.selector.span_ranges(&pixels);
+            if posterize_levels >= 2 {
+                pixels.iter_mut().for_each(|p| *p = posterize(*p, posterize_levels));
+            }
+            // Values from the guide image at the original position of every pixel
+            let guide_values: Option<Vec<u16>> = guide.map(|g| path.iter().map(|&i| g[i as usize] as u16).collect());
+            for (n, (start, end)) in ranges.into_iter().enumerate() {
                 let span = &mut pixels[start..end];
-                self.sorter.sort(span);
+                match &guide_values {
+                    Some(values) => self.sorter.sort_by_values(span, &values[start..end]),
+                    None => self.sorter.sort(span),
+                }
                 // Herringbone: every second span is sorted the other way round
                 if self.alternate && n % 2 == 1 {
                     span.reverse();
                 }
             }
             for (&i, px) in path.iter().zip(pixels.iter()) {
-                unsafe { buffer.set(i as usize, *px) };
+                match single_channel {
+                    None => unsafe { buffer.set(i as usize, *px) },
+                    // Only one channel moves, the other two stay in place
+                    Some(c) => unsafe { buffer.set_channel(i as usize, c, px.0[c]) },
+                }
             }
         });
 
@@ -345,6 +410,15 @@ impl SharedPixelBuffer {
         Rgb([*p, *p.add(1), *p.add(2)])
     }
 
+    /// Writes one channel of pixel `i`.
+    /// Safety: no other thread may read or write pixel `i` at the same time.
+    #[inline]
+    unsafe fn set_channel(&self, i: usize, channel: usize, value: u8) {
+        let offset = i * self.channels + channel;
+        assert!(channel < 3 && offset < self.len);
+        *self.ptr.add(offset) = value;
+    }
+
     /// Writes the RGB values of pixel `i` (other channels stay untouched).
     /// Safety: no other thread may read or write pixel `i` at the same time.
     #[inline]
@@ -356,4 +430,10 @@ impl SharedPixelBuffer {
         *p.add(1) = px.0[1];
         *p.add(2) = px.0[2];
     }
+}
+
+/// Reduces every channel to `levels` evenly spaced values
+fn posterize(p: Rgb<u8>, levels: u8) -> Rgb<u8> {
+    let steps = (levels.max(2) - 1) as f32;
+    Rgb(p.0.map(|c| (((c as f32 / 255.0 * steps).round() / steps) * 255.0).round() as u8))
 }

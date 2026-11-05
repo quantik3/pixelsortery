@@ -22,6 +22,11 @@ pub enum PathCreator {
     X3(i32, i64, f64),
     /// Wavy lines: (amplitude in pixels, wavelength in pixels, horizontal lines?)
     Waves(f32, f32, bool),
+    /// Lines that follow a swirling noise field: (size of the swirls in pixels, random seed)
+    FlowField(f32, u32),
+    /// Rings shaped like a star around the center: (number of points, inner radius 0-1).
+    /// With an inner radius of cos(180°/points) the star becomes a regular polygon.
+    Star(u32, f32),
 }
 
 /// The default center for rays, circles and spirals (relative to the image size)
@@ -45,6 +50,8 @@ impl std::fmt::Display for PathCreator {
                 PathCreator::Diagonally(a) => format!("Diagonally ({}°)", a),
                 PathCreator::Hilbert => "Hilbert Curve".into(),
                 PathCreator::X3(_, _, _) => "x³".into(),
+                PathCreator::FlowField(scale, seed) => format!("Flow Field ({}/{})", scale, seed),
+                PathCreator::Star(points, inner) => format!("Star ({}/{:.2})", points, inner),
                 PathCreator::Waves(a, l, horizontal) => format!(
                     "Waves {} ({}/{})",
                     if *horizontal { "horizontal" } else { "vertical" },
@@ -65,13 +72,24 @@ impl PathCreator {
     pub fn uses_center(self) -> bool {
         matches!(
             self,
-            PathCreator::Rays | PathCreator::Circles | PathCreator::Spiral | PathCreator::SquareSpiral | PathCreator::RectSpiral
+            PathCreator::Rays
+                | PathCreator::Circles
+                | PathCreator::Spiral
+                | PathCreator::SquareSpiral
+                | PathCreator::RectSpiral
+                | PathCreator::Star(..)
         )
     }
 
     /// Creates the raw index paths (may contain invalid or duplicate indices).
     /// `center` is relative to the image size ((0.5, 0.5) is the middle).
     fn index_paths(self, w: u64, h: u64, center: (f32, f32)) -> Vec<Vec<u64>> {
+        // New paths that always use the center
+        if let PathCreator::Star(points, inner) = self {
+            let cx = center.0.clamp(0.0, 1.0) as f64 * w as f64;
+            let cy = center.1.clamp(0.0, 1.0) as f64 * h as f64;
+            return path_star(w, h, cx, cy, points, inner);
+        }
         // The original functions are used for the middle, so old results look exactly the same
         let custom_center = (center != DEFAULT_CENTER && self.uses_center()).then(|| {
             (
@@ -102,6 +120,9 @@ impl PathCreator {
             PathCreator::Hilbert => gilbert::path_hilbert(w, h),
             PathCreator::X3(offset_y, scalar_w, scalar_l) => path_x3(w, h, offset_y, scalar_w as f64, scalar_l as f64),
             PathCreator::Waves(amplitude, wavelength, horizontal) => path_waves(w, h, amplitude, wavelength, horizontal),
+            PathCreator::FlowField(scale, seed) => path_flow_field(w, h, scale, seed),
+            // Handled above
+            PathCreator::Star(..) => Vec::new(),
         }
     }
     pub fn create_paths(self, all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64, reverse: bool) -> Vec<Vec<&mut Rgb<u8>>> {
@@ -739,4 +760,155 @@ fn path_rect_spiral_at(w: u64, h: u64, cx: f64, cy: f64, square: bool) -> Vec<Ve
         };
     }
     vec![path]
+}
+
+
+/// Pseudo random value in [0, 1) for a grid point
+fn hash2(x: i64, y: i64, seed: u32) -> f32 {
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (seed as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    (h >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// Smooth value noise in [0, 1)
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let (ix, iy) = (x0 as i64, y0 as i64);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let top = lerp(hash2(ix, iy, seed), hash2(ix + 1, iy, seed), sx);
+    let bottom = lerp(hash2(ix, iy + 1, seed), hash2(ix + 1, iy + 1, seed), sx);
+    lerp(top, bottom, sy)
+}
+
+/// Direction of the flow field at (x, y) as an angle
+fn flow_angle(x: f32, y: f32, scale: f32, seed: u32) -> f32 {
+    let mut value = 0.0;
+    let mut total = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0 / scale;
+    for octave in 0..3 {
+        value += amplitude * value_noise(x * frequency, y * frequency, seed.wrapping_add(octave * 7919));
+        total += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    (value / total) * 4.0 * std::f32::consts::PI
+}
+
+/// Lines that follow a swirling noise field. Every pixel belongs to exactly one line.
+fn path_flow_field(w: u64, h: u64, scale: f32, seed: u32) -> Vec<Vec<u64>> {
+    const MAX_LENGTH: usize = 4096;
+    let scale = scale.abs().max(1.0);
+    let n = (w * h) as usize;
+    // Direction (step in x and y) at every pixel
+    let directions: Vec<(f32, f32)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            (0..w)
+                .map(|x| {
+                    let angle = flow_angle(x as f32, y as f32, scale, seed);
+                    (angle.cos(), angle.sin())
+                })
+                .collect::<Vec<(f32, f32)>>()
+        })
+        .flatten()
+        .collect();
+
+    let mut visited = vec![false; n];
+    let mut paths = Vec::new();
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut path = vec![start as u64];
+        let (mut fx, mut fy) = ((start as u64 % w) as f32 + 0.5, (start as u64 / w) as f32 + 0.5);
+        let mut last = start;
+        let mut steps_in_same_pixel = 0;
+        while path.len() < MAX_LENGTH {
+            let (dx, dy) = directions[last];
+            fx += dx;
+            fy += dy;
+            if fx < 0.0 || fy < 0.0 || fx >= w as f32 || fy >= h as f32 {
+                break;
+            }
+            let i = (fy as u64 * w + fx as u64) as usize;
+            if i == last {
+                steps_in_same_pixel += 1;
+                if steps_in_same_pixel > 3 {
+                    break;
+                }
+                continue;
+            }
+            steps_in_same_pixel = 0;
+            if visited[i] {
+                break;
+            }
+            visited[i] = true;
+            path.push(i as u64);
+            last = i;
+        }
+        paths.push(path);
+    }
+    paths
+}
+
+/// Rings shaped like a star (or a polygon) around (cx, cy). Each ring starts at the top and goes clockwise.
+fn path_star(w: u64, h: u64, cx: f64, cy: f64, points: u32, inner: f32) -> Vec<Vec<u64>> {
+    let points = points.clamp(2, 100);
+    let inner = (inner as f64).clamp(0.05, 1.0);
+    // Half the angle between two points
+    let sector = PI / points as f64;
+    // The outline between an outer point A = (1, 0) and an inner point B
+    let ab = (inner * sector.cos() - 1.0, inner * sector.sin());
+    let cross = |p: (f64, f64), q: (f64, f64)| p.0 * q.1 - p.1 * q.0;
+    let a_cross_ab = cross((1.0, 0.0), ab);
+    // Radius of the outline (outer points have radius 1) in the direction theta
+    let outline = |theta: f64| -> f64 {
+        // Rotate so one point faces up, then mirror into the first half of a sector
+        let mut phi = (theta + HALF_PI).rem_euclid(2.0 * sector);
+        if phi > sector {
+            phi = 2.0 * sector - phi;
+        }
+        a_cross_ab / cross((phi.cos(), phi.sin()), ab)
+    };
+
+    // Ring number and angle of every pixel
+    let ring_of_pixel: Vec<(u32, f32)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            (0..w)
+                .map(|x| {
+                    let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+                    let theta = dy.atan2(dx);
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    let ring = (distance / outline(theta)) as u32;
+                    // Angle starting at the top, clockwise
+                    let angle = (theta + HALF_PI).rem_euclid(TWO_PI) as f32;
+                    (ring, angle)
+                })
+                .collect::<Vec<(u32, f32)>>()
+        })
+        .flatten()
+        .collect();
+
+    let ring_count = ring_of_pixel.iter().map(|r| r.0).max().map(|m| m as usize + 1).unwrap_or(0);
+    let mut rings: Vec<Vec<(f32, u32)>> = vec![Vec::new(); ring_count];
+    for (i, (ring, angle)) in ring_of_pixel.into_iter().enumerate() {
+        rings[ring as usize].push((angle, i as u32));
+    }
+    rings.par_iter_mut().for_each(|ring| ring.sort_by(|a, b| a.0.total_cmp(&b.0)));
+    rings
+        .into_par_iter()
+        .filter(|ring| !ring.is_empty())
+        .map(|ring| ring.into_iter().map(|(_, i)| i as u64).collect())
+        .collect()
 }

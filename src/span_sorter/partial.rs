@@ -5,12 +5,12 @@ use image::Rgb;
 /// Every round compares neighbouring pixels and swaps them if they are in the wrong order,
 /// so each pixel moves at most `passes` steps towards its place. With few passes this gives
 /// a "dripping" look, with many passes the span becomes completely sorted.
-pub fn partial_sort_mut(pixels: &mut [Rgb<u8>], value_function: for<'a> fn(&'a Rgb<u8>) -> u16, passes: u32) {
+pub fn partial_sort_by_values(pixels: &mut [Rgb<u8>], values: &[u16], passes: u32) {
     let n = pixels.len();
-    if n < 2 {
+    if n < 2 || values.len() != n {
         return;
     }
-    let mut wrapped: Vec<(u16, Rgb<u8>)> = pixels.iter().map(|p| (value_function(p), *p)).collect();
+    let mut wrapped: Vec<(u16, Rgb<u8>)> = values.iter().copied().zip(pixels.iter().copied()).collect();
     // After n rounds the slice is sorted anyway
     let rounds = (passes as usize).min(n);
     for round in 0..rounds {

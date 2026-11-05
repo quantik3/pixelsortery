@@ -18,7 +18,7 @@ use pixelsortery::{
         PixelSelector::{self, *},
     },
     span_sorter::{SortingAlgorithm, SortingCriteria},
-    Pixelsorter,
+    ChannelMode, Pixelsorter,
 };
 #[cfg(feature = "video")]
 use pixelsortery::{Progress, ThreadPhone};
@@ -147,6 +147,8 @@ struct PixelsorterValues {
     path_diagonally_val: f32,
     path_x3: PathCreator,
     path_waves: PathCreator,
+    path_flow: PathCreator,
+    path_star: PathCreator,
     selector_random: PixelSelector,
     selector_fixed: PixelSelector,
     selector_thres: PixelSelector,
@@ -157,6 +159,12 @@ struct PixelsorterValues {
     alternate: bool,
     /// Passes of the partial sort
     passes: u32,
+    /// Strength of stretch and shift
+    amount: f32,
+    /// Which color channels move
+    channels: ChannelMode,
+    /// Posterize levels (0 = off)
+    posterize: u8,
 }
 
 /// A sort running in a background thread
@@ -185,6 +193,9 @@ impl PixelsorterValues {
         ps.sorter.criteria = self.criteria;
         ps.sorter.algorithm = self.algorithm;
         ps.sorter.passes = self.passes;
+        ps.sorter.amount = self.amount;
+        ps.channels = self.channels;
+        ps.posterize = self.posterize;
         ps.reverse = self.reverse;
         ps.path_center = self.path_center;
         ps.alternate = self.alternate;
@@ -197,6 +208,9 @@ impl PixelsorterValues {
         self.criteria = ps.sorter.criteria;
         self.algorithm = ps.sorter.algorithm;
         self.passes = ps.sorter.passes;
+        self.amount = ps.sorter.amount;
+        self.channels = ps.channels;
+        self.posterize = ps.posterize;
         self.reverse = ps.reverse;
         self.path_center = ps.path_center;
         self.alternate = ps.alternate;
@@ -204,8 +218,11 @@ impl PixelsorterValues {
         if let PathCreator::Diagonally(a) = self.path {
             self.path_diagonally_val = a;
         }
-        if let PathCreator::Waves(..) = self.path {
-            self.path_waves = self.path;
+        match self.path {
+            PathCreator::Waves(..) => self.path_waves = self.path,
+            PathCreator::FlowField(..) => self.path_flow = self.path,
+            PathCreator::Star(..) => self.path_star = self.path,
+            _ => {}
         }
         match self.selector {
             Fixed { len } => self.selector_fixed = Fixed { len },
@@ -241,6 +258,11 @@ impl Default for PixelsorterGui {
                 path_diagonally_val: 45.0,
                 path_x3: PathCreator::X3(0, 300, 10.0),
                 path_waves: PathCreator::Waves(20.0, 120.0, false),
+                path_flow: PathCreator::FlowField(150.0, 1),
+                path_star: PathCreator::Star(5, 0.5),
+                amount: 0.5,
+                channels: ChannelMode::All,
+                posterize: 0,
                 selector_edges: PixelSelector::Edges { threshold: 80 },
                 path_center: DEFAULT_CENTER,
                 alternate: false,
@@ -632,6 +654,43 @@ impl PixelsorterGui {
                     self.do_sort = true;
                 }
                 ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    /// Loads a guide image for the current layer and switches the criteria to "Guide"
+    fn load_guide_image(&mut self) {
+        let Some(ls) = &mut self.layered_sorter else { return };
+        let Some(file) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()
+        else {
+            return;
+        };
+        match image::open(&file) {
+            Ok(guide) => {
+                let (w, h) = ls.image_size();
+                let guide = guide
+                    .resize_exact(w, h, image::imageops::FilterType::Triangle)
+                    .into_luma8();
+                ls.set_current_guide(Some(guide));
+                self.values.criteria = SortingCriteria::Guide;
+                // The values are read back from the layer every frame, so write them there
+                ls.update_current(self.values);
+                if self.auto_sort {
+                    self.do_sort = true;
+                }
+            }
+            Err(e) => warn!("Could not open guide image '{}': {}", file.to_string_lossy(), e),
+        }
+    }
+
+    /// Removes the guide image of the current layer
+    fn remove_guide_image(&mut self) {
+        if let Some(ls) = &mut self.layered_sorter {
+            ls.set_current_guide(None);
+            if self.auto_sort {
+                self.do_sort = true;
             }
         }
     }

@@ -16,8 +16,10 @@ pub(crate) struct SortingLayer {
     /// Painted mask: only pixels where the mask is white (>= 128) get sorted.
     /// None means the whole image is sorted.
     paint_mask: Option<GrayImage>,
-    /// Increased every time the painted mask changes, to detect outdated background results
+    /// Increased every time the painted mask or the guide changes, to detect outdated background results
     mask_revision: u64,
+    /// Guide image (brightness, same size as the image) for the criteria "Guide"
+    guide: Option<GrayImage>,
 }
 
 /// Everything needed to sort some layers in a background thread
@@ -26,8 +28,8 @@ pub(crate) struct SortJob {
     pub(crate) start: usize,
     /// The image the first layer is applied to
     input: RgbImage,
-    /// Sorter and mask for every layer from `start` up to the current layer
-    steps: Vec<(Pixelsorter, Option<GrayImage>)>,
+    /// Sorter, mask and guide for every layer from `start` up to the current layer
+    steps: Vec<(Pixelsorter, Option<GrayImage>, Option<GrayImage>)>,
     /// Values and mask revisions the job was created with
     checks: Vec<(PixelsorterValues, u64)>,
 }
@@ -37,8 +39,8 @@ impl SortJob {
     pub(crate) fn run(self) -> SortJobResult {
         let mut results = Vec::with_capacity(self.steps.len());
         let mut img = self.input;
-        for (ps, mask) in &self.steps {
-            ps.sort_with_mask(&mut img, mask.as_ref());
+        for (ps, mask, guide) in &self.steps {
+            ps.sort_with_mask_and_guide(&mut img, mask.as_ref(), guide.as_ref());
             results.push(img.clone());
         }
         SortJobResult { start: self.start, images: results, checks: self.checks }
@@ -89,6 +91,7 @@ impl LayeredSorter {
         if img.dimensions() != self.base_img.dimensions() {
             for layer in self.layers.iter_mut() {
                 layer.paint_mask = None;
+                layer.guide = None;
                 layer.mask_revision += 1;
             }
         }
@@ -140,7 +143,7 @@ impl LayeredSorter {
             input,
             steps: layers
                 .iter()
-                .map(|l| (l.sorting_values.to_pixelsorter(), l.paint_mask.clone()))
+                .map(|l| (l.sorting_values.to_pixelsorter(), l.paint_mask.clone(), l.guide.clone()))
                 .collect(),
             checks: layers.iter().map(|l| (l.sorting_values, l.mask_revision)).collect(),
         })
@@ -163,6 +166,26 @@ impl LayeredSorter {
         if applied > 0 {
             self.invalidate_layers_above(start + applied - 1, false);
         }
+    }
+
+    /// The guide image of the current layer
+    pub(crate) fn get_current_guide(&self) -> Option<&GrayImage> {
+        self.get_current_layer().guide.as_ref()
+    }
+
+    /// Sets the guide image of the current layer (it has to have the size of the image)
+    pub(crate) fn set_current_guide(&mut self, guide: Option<GrayImage>) {
+        let fits = guide.as_ref().map(|g| g.dimensions() == self.base_img.dimensions()).unwrap_or(true);
+        if fits {
+            self.layers.get_mut(self.current_layer).unwrap().guide = guide;
+            // Same handling as a changed mask: sort again, outdated results are dropped
+            self.paint_mask_changed();
+        }
+    }
+
+    /// Size of the image
+    pub(crate) fn image_size(&self) -> (u32, u32) {
+        self.base_img.dimensions()
     }
 
     /// Creates a mask with the size of the image, filled with one value (0 = nothing sorted, 255 = everything sorted)
@@ -319,6 +342,7 @@ impl SortingLayer {
             needs_sorting: true,
             paint_mask: None,
             mask_revision: 0,
+            guide: None,
         }
     }
 
@@ -347,7 +371,9 @@ impl SortingLayer {
 
     fn sort(&mut self, img: &RgbImage) {
         let mut sorted_img = img.clone();
-        self.sorting_values.to_pixelsorter().sort_with_mask(&mut sorted_img, self.paint_mask.as_ref());
+        self.sorting_values
+            .to_pixelsorter()
+            .sort_with_mask_and_guide(&mut sorted_img, self.paint_mask.as_ref(), self.guide.as_ref());
         self.sorted_img = sorted_img;
         self.needs_sorting = false;
     }

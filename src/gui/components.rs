@@ -38,6 +38,8 @@ impl PixelsorterGui {
             PathCreator::Hilbert,
             self.values.path_x3.clone(),
             self.values.path_waves.clone(),
+            self.values.path_flow.clone(),
+            self.values.path_star.clone(),
         ];
         let selected_text = self.values.path.to_string();
 
@@ -150,11 +152,66 @@ impl PixelsorterGui {
                     });
                 ui.end_row();
             }
+            PathCreator::FlowField(ref mut scale, ref mut seed) => {
+                ui.label("");
+                egui::Grid::new(format!("path_options_grid_{}", id))
+                    .num_columns(2)
+                    .min_row_height(25.0)
+                    .show(ui, |ui| {
+                        ui.label(important_text("Swirl size"));
+                        ui.add(
+                            egui::Slider::new(scale, 5.0..=3000.0)
+                                .logarithmic(true)
+                                .clamping(SliderClamping::Never)
+                                .max_decimals(0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text("Size of the swirls. Small = chaotic, big = calm flowing lines");
+                        ui.end_row();
+                        ui.label(important_text("Seed"));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(seed));
+                            if ui.button("New").on_hover_text("Another random flow field").clicked() {
+                                *seed = rand::random::<u32>() % 100_000;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.end_row();
+            }
+            PathCreator::Star(ref mut points, ref mut inner) => {
+                ui.label("");
+                egui::Grid::new(format!("path_options_grid_{}", id))
+                    .num_columns(2)
+                    .min_row_height(25.0)
+                    .show(ui, |ui| {
+                        ui.label(important_text("Points"));
+                        ui.add(egui::Slider::new(points, 2..=24));
+                        ui.end_row();
+                        ui.label(important_text("Inner"));
+                        ui.add(egui::Slider::new(inner, 0.05..=1.0).fixed_decimals(2))
+                            .on_hover_text("Size of the inner corners. Small = spiky star, 1 = flower-like");
+                        ui.end_row();
+                        ui.label("");
+                        if ui
+                            .button("Polygon")
+                            .on_hover_text("Make the star a regular polygon (triangle, square, pentagon, ...)")
+                            .clicked()
+                        {
+                            *inner = (std::f32::consts::PI / (*points).max(2) as f32).cos();
+                        }
+                        ui.end_row();
+                    });
+                ui.end_row();
+            }
             _ => {}
         };
-        // Remember the wave settings for when we reselect waves
-        if let PathCreator::Waves(..) = self.values.path {
-            self.values.path_waves = self.values.path;
+        // Remember the settings for when we reselect these paths
+        match self.values.path {
+            PathCreator::Waves(..) => self.values.path_waves = self.values.path,
+            PathCreator::FlowField(..) => self.values.path_flow = self.values.path,
+            PathCreator::Star(..) => self.values.path_star = self.values.path,
+            _ => {}
         }
 
         // Center of rays, circles and spirals
@@ -352,6 +409,7 @@ impl PixelsorterGui {
                     SortingCriteria::Red,
                     SortingCriteria::Green,
                     SortingCriteria::Blue,
+                    SortingCriteria::Guide,
                 ]
                 .into_iter()
                 .for_each(|c| {
@@ -369,6 +427,8 @@ impl PixelsorterGui {
                     SortingAlgorithm::Shellsort,
                     SortingAlgorithm::Glitchsort,
                     SortingAlgorithm::Partial,
+                    SortingAlgorithm::Stretch,
+                    SortingAlgorithm::Shift,
                     SortingAlgorithm::DebugColor,
                 ]
                 .into_iter()
@@ -418,12 +478,70 @@ impl PixelsorterGui {
                     .on_hover_text("How far pixels move towards their place. Few passes = dripping look");
                     ui.end_row();
                 }
+                if matches!(self.values.algorithm, SortingAlgorithm::Stretch | SortingAlgorithm::Shift) {
+                    ui.label(important_text("Amount"));
+                    ui.add(egui::Slider::new(&mut self.values.amount, 0.0..=1.0).fixed_decimals(2))
+                        .on_hover_text(if self.values.algorithm == SortingAlgorithm::Stretch {
+                            "How much of each span gets overwritten by its stretched beginning"
+                        } else {
+                            "Maximum shift, relative to the span length"
+                        });
+                    ui.end_row();
+                }
                 // SORTING CRITERIA
                 ui.label(important_text("Criteria"));
                 ui.horizontal(|ui| {
                     ui.label("by");
                     self.criteria_combo_box(ui, id);
                 });
+                ui.end_row();
+                // GUIDE IMAGE
+                if self.values.criteria == SortingCriteria::Guide {
+                    let has_guide = self
+                        .layered_sorter
+                        .as_ref()
+                        .map(|ls| ls.get_current_guide().is_some())
+                        .unwrap_or(false);
+                    ui.label(important_text("Guide"));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(self.layered_sorter.is_some(), Button::new("Load..."))
+                            .on_hover_text("Pixels are sorted by the brightness of this image at their position")
+                            .clicked()
+                        {
+                            self.load_guide_image();
+                        }
+                        if ui.add_enabled(has_guide, Button::new("Remove")).clicked() {
+                            self.remove_guide_image();
+                        }
+                        ui.label(
+                            RichText::new(if has_guide { "loaded" } else { "none: sorted by brightness" }).small(),
+                        );
+                    });
+                    ui.end_row();
+                }
+                // CHANNELS
+                ui.label(important_text("Channels"));
+                ui.horizontal(|ui| {
+                    for (c, name) in [
+                        (ChannelMode::All, "All"),
+                        (ChannelMode::Red, "R"),
+                        (ChannelMode::Green, "G"),
+                        (ChannelMode::Blue, "B"),
+                    ] {
+                        ui.selectable_value(&mut self.values.channels, c, name);
+                    }
+                })
+                .response
+                .on_hover_text("Move only one color channel, the others stay in place. Try a layer per channel with different paths");
+                ui.end_row();
+                // POSTERIZE
+                ui.label(important_text("Posterize"));
+                ui.add(
+                    egui::Slider::new(&mut self.values.posterize, 0..=16)
+                        .custom_formatter(|v, _| if v < 2.0 { "Off".to_string() } else { format!("{}", v as u32) }),
+                )
+                .on_hover_text("Reduce the colors of the sorted pixels to this many levels per channel");
                 ui.end_row();
                 // PATTERN
                 ui.label(important_text("Pattern"));
