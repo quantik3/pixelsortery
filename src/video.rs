@@ -88,11 +88,13 @@ impl Transcoder {
         if let Ok(parallelism) = std::thread::available_parallelism() {
             dec_context.set_threading(ffmpeg::threading::Config {
                 kind: ffmpeg::threading::Type::Frame,
-                count: parallelism.get(),
+                // x264 warns about more than 16 threads
+                count: parallelism.get().min(16),
             });
             enc_context.set_threading(ffmpeg::threading::Config {
                 kind: ffmpeg::threading::Type::Frame,
-                count: parallelism.get(),
+                // x264 warns about more than 16 threads
+                count: parallelism.get().min(16),
             });
         }
         // A decoder. `send_packet()` to it and `receive_frame()` from it
@@ -318,6 +320,7 @@ impl Pixelsorter {
                 output_path.to_string(),
                 cancel_signal.clone(),
             );
+        let was_cancelled = cancel_signal.clone();
         // Start thread
         let join_handle = std::thread::spawn(move ||{
             let timer = Instant::now();
@@ -326,6 +329,8 @@ impl Pixelsorter {
                 Ok(_) => {
                     println!("\n=== Success! Finished in {:?} !===", timer.elapsed());
                 },
+                // Pressing "Stop" is not an error
+                Err(_) if was_cancelled.load(Ordering::Relaxed) => println!("\n=== Export stopped after {:?} ===", timer.elapsed()),
                 Err(e) => error!("Error sorting video: {e}")
             };
         });
@@ -432,7 +437,8 @@ pub fn extract_video_frame(input_path: &str, frame_time_stamp: f32) -> Result<Op
     if let Ok(parallelism) = std::thread::available_parallelism() {
         dec_context.set_threading(ffmpeg::threading::Config {
             kind: ffmpeg::threading::Type::Frame,
-            count: parallelism.get(),
+            // x264 warns about more than 16 threads
+                count: parallelism.get().min(16),
         });
     }
     let mut decoder = dec_context.decoder().video().unwrap();

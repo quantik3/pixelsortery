@@ -152,6 +152,10 @@ struct PixelsorterGui {
     preset_text: String,
     /// Sort in a background thread, so the window stays responsive
     background_sort: bool,
+    /// While a slider is dragged, sort a smaller copy (needs background sorting)
+    fast_preview: bool,
+    /// A preview is shown: the full image has to be sorted when the mouse is released
+    preview_shown: bool,
     /// The currently running background sort
     background_job: Option<BackgroundSort>,
     /// Another sort was requested while one was running (true = forced sort)
@@ -366,6 +370,8 @@ impl Default for PixelsorterGui {
             selected_preset: None,
             preset_text: String::new(),
             background_sort: true,
+            fast_preview: true,
+            preview_shown: false,
             background_job: None,
             background_pending: None,
             sort_generation: 0,
@@ -451,7 +457,9 @@ impl PixelsorterGui {
 
     fn start_background_sort(&mut self, ctx: &egui::Context, force: bool) {
         let Some(ls) = &self.layered_sorter else { return };
-        match ls.prepare_sort_job(force) {
+        // A quick preview while the mouse is held (dragging a slider)
+        let preview = self.fast_preview && ctx.input(|i| i.pointer.any_down());
+        match ls.prepare_sort_job(force, preview) {
             None => {
                 // Everything is sorted already, just show it
                 self.img = Some(ls.get_current_layer().get_img().clone());
@@ -505,7 +513,10 @@ impl PixelsorterGui {
                                 self.img = Some(img.clone());
                             }
                         }
-                        // Only keep the newest result
+                        if result.is_preview() {
+                            self.preview_shown = true;
+                        }
+                        // Only keep the newest result (previews are never kept)
                         if is_newest {
                             ls.apply_sort_result(result);
                         }
@@ -1227,6 +1238,13 @@ impl eframe::App for PixelsorterGui {
 
         // Pick up results of the background sort
         self.poll_background_sort(ctx);
+        // After a preview: sort the full image once the mouse is released
+        if self.preview_shown && !ctx.input(|i| i.pointer.any_down()) {
+            self.preview_shown = false;
+            if self.layered_sorter.is_some() {
+                self.request_background_sort(ctx, false);
+            }
+        }
 
         // UI //
 
@@ -1392,6 +1410,8 @@ impl eframe::App for PixelsorterGui {
                                 ui.checkbox(&mut self.auto_sort, "Auto-sort");
                                 ui.checkbox(&mut self.background_sort, "Background")
                                     .on_hover_text("Sort in a background thread: the window stays responsive while sorting");
+                                ui.add_enabled(self.background_sort, egui::Checkbox::new(&mut self.fast_preview, "Fast preview"))
+                                    .on_hover_text("While a slider is dragged, a smaller copy is sorted (approximate). The full image follows when you let go");
                             });
                             let ui = &mut columns[1];
                             ui.with_layout(Layout::top_down(Align::Center), |ui| {

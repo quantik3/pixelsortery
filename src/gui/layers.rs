@@ -1,4 +1,8 @@
-use image::{GrayImage, Luma, RgbImage};
+use image::{
+    imageops::{self, FilterType},
+    GrayImage, Luma, RgbImage,
+};
+use pixelsortery::{path_creator::PathCreator, pixel_selector::PixelSelector};
 use std::sync::Arc;
 use pixelsortery::Pixelsorter;
 
@@ -56,28 +60,72 @@ pub(crate) struct SortJob {
     steps: Vec<(PixelsorterValues, Option<GrayImage>, Option<GrayImage>, Option<Arc<Vec<f32>>>)>,
     /// Values and mask revisions the job was created with
     checks: Vec<(PixelsorterValues, u64)>,
+    /// Sort a smaller copy for a quick preview (only shown, not kept)
+    preview: bool,
 }
+
+/// Longer side of the image in a quick preview
+const PREVIEW_SIZE: u32 = 1000;
 
 impl SortJob {
     /// Sorts all layers of the job one after another. Returns the sorted image of every layer.
     pub(crate) fn run(self) -> SortJobResult {
+        let (w, h) = self.input.dimensions();
+        let scale = PREVIEW_SIZE as f32 / w.max(h).max(1) as f32;
+        if self.preview && scale < 1.0 {
+            return self.run_preview(scale);
+        }
         let mut results = Vec::with_capacity(self.steps.len());
         let mut img = self.input;
         for (values, mask, guide, directions) in &self.steps {
             img = values.render(&img, mask.as_ref(), guide.as_ref(), directions.as_deref().map(|d| d.as_slice()));
             results.push(img.clone());
         }
-        SortJobResult { start: self.start, images: results, checks: self.checks }
+        SortJobResult { start: self.start, images: results, checks: self.checks, preview: false }
     }
+
+    /// Sorts a smaller copy (everything scaled by `scale`), then enlarges the result for showing it
+    fn run_preview(self, scale: f32) -> SortJobResult {
+        let (w, h) = self.input.dimensions();
+        let (sw, sh) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+        let mut img = imageops::resize(&self.input, sw, sh, FilterType::Triangle);
+        for (values, mask, guide, directions) in &self.steps {
+            let mask = mask.as_ref().map(|m| imageops::resize(m, sw, sh, FilterType::Triangle));
+            let guide = guide.as_ref().map(|g| imageops::resize(g, sw, sh, FilterType::Triangle));
+            let directions = directions.as_deref().map(|d| scale_directions(d, w, h, sw, sh));
+            img = values.scaled(scale).render(&img, mask.as_ref(), guide.as_ref(), directions.as_deref());
+        }
+        let shown = imageops::resize(&img, w, h, FilterType::Nearest);
+        SortJobResult { start: self.start, images: vec![shown], checks: Vec::new(), preview: true }
+    }
+}
+
+/// Picks the painted direction for every pixel of a smaller image (nearest pixel)
+fn scale_directions(directions: &[f32], w: u32, h: u32, sw: u32, sh: u32) -> Vec<f32> {
+    let mut scaled = Vec::with_capacity((sw * sh) as usize);
+    for y in 0..sh {
+        let sy = ((y as u64 * h as u64) / sh as u64).min(h as u64 - 1);
+        for x in 0..sw {
+            let sx = ((x as u64 * w as u64) / sw as u64).min(w as u64 - 1);
+            scaled.push(directions[(sy * w as u64 + sx) as usize]);
+        }
+    }
+    scaled
 }
 
 pub(crate) struct SortJobResult {
     start: usize,
     images: Vec<RgbImage>,
     checks: Vec<(PixelsorterValues, u64)>,
+    preview: bool,
 }
 
 impl SortJobResult {
+    /// A quick preview of a smaller copy: only for showing, not kept in the layers
+    pub(crate) fn is_preview(&self) -> bool {
+        self.preview
+    }
+
     /// The sorted image of the last (= the current) layer
     pub(crate) fn last_image(&self) -> Option<&RgbImage> {
         self.images.last()
@@ -151,7 +199,7 @@ impl LayeredSorter {
 
     /// Prepares sorting the current layer (and all layers below that need it) in a background thread.
     /// Returns None if nothing needs to be sorted (and `force` is false).
-    pub(crate) fn prepare_sort_job(&self, force: bool) -> Option<SortJob> {
+    pub(crate) fn prepare_sort_job(&self, force: bool, preview: bool) -> Option<SortJob> {
         let current = self.current_layer;
         let start = self
             .layers
@@ -173,12 +221,16 @@ impl LayeredSorter {
                 .map(|l| (l.sorting_values, l.paint_mask.clone(), l.guide.clone(), l.directions.clone()))
                 .collect(),
             checks: layers.iter().map(|l| (l.sorting_values, l.mask_revision)).collect(),
+            preview,
         })
     }
 
     /// Puts the results of a background sort into the layers.
     /// Results of layers whose values or mask changed in the meantime are thrown away (and all above).
     pub(crate) fn apply_sort_result(&mut self, result: SortJobResult) {
+        if result.preview {
+            return;
+        }
         let start = result.start;
         let mut applied = 0;
         for (j, (img, (values, revision))) in result.images.into_iter().zip(result.checks).enumerate() {
@@ -508,6 +560,27 @@ impl SortingLayer {
 }
 
 impl PixelsorterValues {
+    /// The values for an image scaled by `scale`: lengths in pixels are scaled too
+    pub(crate) fn scaled(&self, scale: f32) -> PixelsorterValues {
+        let px = |v: f32| v * scale;
+        let mut values = *self;
+        values.selector = match self.selector {
+            // 0 means "no spans" for these selectors, keep that
+            PixelSelector::Fixed { len } if len > 0 => PixelSelector::Fixed { len: (px(len as f32).round() as u64).max(1) },
+            PixelSelector::Random { max } if max > 1 => PixelSelector::Random { max: (px(max as f32).round() as u32).max(2) },
+            other => other,
+        };
+        values.path = match self.path {
+            PathCreator::Waves(amplitude, wavelength, horizontal) => {
+                PathCreator::Waves(px(amplitude), px(wavelength).max(2.0), horizontal)
+            }
+            PathCreator::FlowField(size, seed) => PathCreator::FlowField(px(size).max(1.0), seed),
+            PathCreator::X3(offset, width, slope) => PathCreator::X3(px(offset as f32) as i32, px(width as f32) as i64, slope),
+            other => other,
+        };
+        values
+    }
+
     /// Sorts the image with these values and blends the result over it (blend mode, opacity, mask)
     pub(crate) fn render(
         &self,
