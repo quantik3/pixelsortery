@@ -295,16 +295,22 @@ impl PixelsorterGui {
 
     pub(super) fn selector_combo_box(&mut self, ui: &mut Ui, id: u64) {
         ui.visuals_mut().weak_text_color();
-        // Wraps into two rows if needed, so it never widens the side panel
-        ui.horizontal_wrapped(|ui| {
-            for (s, n) in vec![
+        // Two fixed rows: all five don't fit into one row of the side panel
+        let rows = [
+            vec![
                 (self.values.selector_fixed, "Fixed"),
                 (self.values.selector_random, "Random"),
                 (self.values.selector_thres, "Threshold"),
-                (self.values.selector_edges, "Edges"),
-                (self.values.selector_combined, "Combined"),
-            ] {
-                ui.selectable_value(&mut self.values.selector, s, n);
+            ],
+            vec![(self.values.selector_edges, "Edges"), (self.values.selector_combined, "Combined")],
+        ];
+        ui.vertical(|ui| {
+            for row in rows {
+                ui.horizontal(|ui| {
+                    for (s, n) in row {
+                        ui.selectable_value(&mut self.values.selector, s, n);
+                    }
+                });
             }
         });
         ui.end_row();
