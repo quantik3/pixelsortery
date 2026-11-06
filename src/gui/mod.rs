@@ -1643,41 +1643,35 @@ impl eframe::App for PixelsorterGui {
 
                         ui.add_space(5.0);
 
-                        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                            ui.add_space(5.0);
-                            // SAVING OPTIONS
-                            ui.add_enabled_ui(self.img.is_some(), |ui| {
-                                ui.group(|ui| {
-                                    self.save_options_panel(ui);
-                                });
-                            });
-                            ui.add_space(5.0);
-                            ui.group(|ui| {
-                                // LAYERING
-                                ui.style_mut().spacing.scroll.floating = false;
-                                ui.add_enabled_ui(self.layered_sorter.is_some(), |ui|{
-                                    ScrollArea::vertical()
-                                        // .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
-                                        .id_salt("LayerScrollArea")
-                                        .show(ui, |ui| {
-                                            Flex::vertical()
-                                                .h_full()
-                                                .w_full()
-                                                .wrap(false)
-                                                .justify(FlexJustify::End)
-                                                .align_items(FlexAlign::Stretch)
-                                                .show(ui, |flex| {
-                                                    // flex.grow();
-                                                    //for i in 0..8 {
-                                                    //    let b = Button::new(format!("LMAO: {}", i));
-                                                    //    flex.add(item().basis(30.0), b);
-                                                    //}
-                                                    self.layering_panel(flex);
-                                                });
-                                        });
-                                });
+                        // LAYERING (top to bottom: content above can't overlap it when it grows)
+                        ui.group(|ui| {
+                            ui.set_width(full_width(&ui));
+                            ui.style_mut().spacing.scroll.floating = false;
+                            ui.add_enabled_ui(self.layered_sorter.is_some(), |ui| {
+                                ScrollArea::vertical()
+                                    .id_salt("LayerScrollArea")
+                                    // Many layers scroll inside this list
+                                    .max_height(230.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        Flex::vertical()
+                                            .w_full()
+                                            .wrap(false)
+                                            .align_items(FlexAlign::Stretch)
+                                            .show(ui, |flex| {
+                                                self.layering_panel(flex);
+                                            });
+                                    });
                             });
                         });
+                        ui.add_space(5.0);
+                        // SAVING OPTIONS
+                        ui.add_enabled_ui(self.img.is_some(), |ui| {
+                            ui.group(|ui| {
+                                self.save_options_panel(ui);
+                            });
+                        });
+                        ui.add_space(5.0);
                     });
             });
 

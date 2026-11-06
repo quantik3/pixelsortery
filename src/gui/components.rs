@@ -778,7 +778,6 @@ impl PixelsorterGui {
                         ui.add(
                             egui::DragValue::new(&mut self.anim_max_size)
                                 .range(0..=8000)
-                                .suffix(" px")
                                 .custom_formatter(|v, _| if v < 1.0 { "full size".to_string() } else { format!("{} px", v as u32) }),
                         )
                         .on_hover_text("Longer side of the GIF (0 = full size). Big GIFs get huge and slow");

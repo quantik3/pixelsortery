@@ -52,17 +52,17 @@ jobs:
     
     steps:
     # Checkout either the tag or main (on nightly build)
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       if: env.TAG_NAME != 'nightly'
       with: 
         ref: ${{ env.TAG_NAME }}
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       if: env.TAG_NAME == 'nightly'
       with: 
         ref: main
     
     - name: Cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/.cargo/registry
@@ -95,7 +95,7 @@ jobs:
         mv  "$src" "$dst"
         echo "BIN_NAME=$dst" >> $GITHUB_ENV
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v6
       with:
         path: ${{ env.BIN_NAME }}
         name: ${{ matrix.bin_name }}
@@ -116,12 +116,12 @@ jobs:
     # Nightly Gedöns
     # Must perform checkout first, since it deletes the target directory
     # before running, and would therefore delete the downloaded artifacts
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       if: env.TAG_NAME == 'nightly'
       with: 
         ref: main
 
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v7
       with:
         path: artifacts
         merge-multiple: true
@@ -129,7 +129,7 @@ jobs:
 
     # Update normal release artifacts
     - name: Upload artifact to release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       if: env.TAG_NAME != 'nightly'
       with:
         tag_name: ${{ env.TAG_NAME }}
