@@ -3,13 +3,13 @@ use eframe::egui::{
     self, Align, Button, Color32, Image, Key, Layout, Modifiers, RichText, ScrollArea,
     TextureFilter, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use egui::{scroll_area::ScrollBarVisibility, style::ScrollStyle, pos2, ColorImage, Hyperlink, Modal, Pos2, Rect, Response, Rgba, Sense, Stroke};
+use egui::{scroll_area::ScrollBarVisibility, style::ScrollStyle, pos2, Align2, ColorImage, FontId, Hyperlink, Id, LayerId, Modal, Order, PointerButton, Pos2, Rect, Response, Rgba, Sense, Stroke};
 use egui_flex::{item, Flex, FlexAlign, FlexAlignContent, FlexJustify};
 #[cfg(feature = "video")]
 use egui_video::PlayerState;
 use image::{GrayImage, Pixel, Rgb, RgbImage, RgbaImage};
 use inflections::case::to_title_case;
-use layers::{LayeredSorter, SortJobResult};
+use layers::{LayeredSorter, SortJobResult, StackSnapshot};
 use log::{info, warn};
 use pixelsortery::{
     path_creator::{PathCreator, DEFAULT_CENTER},
@@ -28,6 +28,7 @@ use std::{
 
 use crate::{AUTHORS, PACKAGE_NAME, VERSION};
 mod blend;
+mod presets;
 mod brush;
 mod layers;
 use blend::BlendMode;
@@ -125,6 +126,30 @@ struct PixelsorterGui {
     last_brush_pos: Option<(f32, f32)>,
     /// The next click on the image sets the center of rays, circles and spirals
     picking_center: bool,
+    /// Zoom of the image view (1 = fit into the window)
+    view_zoom: f32,
+    /// Offset of the image view in screen pixels
+    view_pan: Vec2,
+    /// Before/after comparison: the original image is shown left of the divider
+    compare: bool,
+    /// Position of the comparison divider (0 - 1 of the image width)
+    compare_pos: f32,
+    /// Texture of the original image (for the comparison)
+    original_texture: Option<TextureHandle>,
+    /// Undo history (older states)
+    undo_stack: Vec<StackSnapshot>,
+    /// Redo history
+    redo_stack: Vec<StackSnapshot>,
+    /// The state the last undo entry was made for
+    undo_current: Option<StackSnapshot>,
+    /// Saved presets: (name, settings as text)
+    presets: Vec<(String, String)>,
+    /// Name typed in for a new preset
+    preset_name: String,
+    /// Index of the preset selected in the list
+    selected_preset: Option<usize>,
+    /// Settings text typed or pasted in
+    preset_text: String,
     /// Sort in a background thread, so the window stays responsive
     background_sort: bool,
     /// The currently running background sort
@@ -328,6 +353,18 @@ impl Default for PixelsorterGui {
             mask_stroke_changed: false,
             last_brush_pos: None,
             picking_center: false,
+            view_zoom: 1.0,
+            view_pan: Vec2::ZERO,
+            compare: false,
+            compare_pos: 0.5,
+            original_texture: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_current: None,
+            presets: presets::load_presets(),
+            preset_name: String::new(),
+            selected_preset: None,
+            preset_text: String::new(),
             background_sort: true,
             background_job: None,
             background_pending: None,
@@ -527,24 +564,23 @@ impl PixelsorterGui {
         let painting = !picking && self.mask_edit && self.layered_sorter.is_some();
         if let Some(tex) = &self.texture {
             let (tex_id, tex_size) = (tex.id(), tex.size_vec2());
-            let sense = if picking {
-                Sense::click()
-            } else if painting {
-                Sense::click_and_drag()
-            } else {
-                Sense::hover()
-            };
-            let response = egui::Frame::group(ui.style_mut())
-                .inner_margin(0)
-                .show(ui, |ui| {
-                    ui.add(Image::new((tex_id, tex_size)).shrink_to_fit().sense(sense))
-                })
-                .inner;
+            let sense = Sense::click_and_drag();
+            let (area, response) = ui.allocate_exact_size(ui.available_size(), sense);
+            let img_rect = self.image_view(ui, &response, area, tex_size, painting || picking);
+
+            let painter = ui.painter_at(area);
+            let full_uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            painter.image(tex_id, img_rect, full_uv, Color32::WHITE);
+            if self.compare && !self.show_base_image {
+                self.draw_comparison(ui, &response, area, img_rect, painting || picking);
+            }
+            painter.rect_stroke(img_rect, 0.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Outside);
+
             if painting {
-                self.mask_painting(ui, &response);
+                self.mask_painting(ui, &response, img_rect, area);
             }
             if picking {
-                self.center_picking(ui, &response);
+                self.center_picking(ui, &response, img_rect);
             }
         }
         if !painting {
@@ -553,11 +589,83 @@ impl PixelsorterGui {
         }
     }
 
+    /// Zoom (mouse wheel) and pan (middle mouse button, or left button when no tool is active) of the image.
+    /// Returns where the image is drawn on the screen.
+    fn image_view(&mut self, ui: &Ui, response: &Response, area: Rect, tex_size: Vec2, tool_active: bool) -> Rect {
+        // Like before: big images are shrunk to fit, small ones are not enlarged
+        let fit = (area.width() / tex_size.x).min(area.height() / tex_size.y).min(1.0);
+        let image_rect = |zoom: f32, pan: Vec2| Rect::from_center_size(area.center() + pan, tex_size * fit * zoom);
+
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let old_rect = image_rect(self.view_zoom, self.view_pan);
+                let new_zoom = (self.view_zoom * (scroll * 0.003).exp()).clamp(1.0, 64.0);
+                // Zoom towards the mouse: the point under the mouse stays where it is
+                if let Some(mouse) = response.hover_pos() {
+                    let relative = (mouse - old_rect.center()) / old_rect.size();
+                    let new_size = tex_size * fit * new_zoom;
+                    let new_center = mouse - relative * new_size;
+                    self.view_pan = new_center - area.center();
+                }
+                self.view_zoom = new_zoom;
+            }
+        }
+        let comparing = self.compare && !self.show_base_image;
+        let panning = response.dragged_by(PointerButton::Middle)
+            || (!tool_active && !comparing && response.dragged_by(PointerButton::Primary));
+        if panning {
+            self.view_pan += response.drag_delta();
+        }
+        if response.double_clicked() && !tool_active {
+            self.view_zoom = 1.0;
+        }
+        if self.view_zoom <= 1.0 {
+            // Fitted image: always centered
+            self.view_pan = Vec2::ZERO;
+        }
+        image_rect(self.view_zoom, self.view_pan)
+    }
+
+    /// Shows the original image left of a divider. Dragging on the image moves the divider.
+    fn draw_comparison(&mut self, ui: &Ui, response: &Response, area: Rect, img_rect: Rect, tool_active: bool) {
+        let Some(ls) = &self.layered_sorter else { return };
+        let base = ls.get_base_img();
+        let size = [base.width() as usize, base.height() as usize];
+        if self.original_texture.as_ref().map(|t| t.size() != size).unwrap_or(true) {
+            let image = egui::ColorImage::from_rgb(size, base.as_raw());
+            self.original_texture = Some(ui.ctx().load_texture("original-image", image, mask_texture_options()));
+        }
+        if !tool_active && (response.dragged_by(PointerButton::Primary) || response.clicked()) {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.compare_pos = ((p.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0);
+            }
+        }
+        let split_x = img_rect.min.x + self.compare_pos * img_rect.width();
+        let left = Rect::from_min_max(img_rect.min, pos2(split_x, img_rect.max.y)).intersect(area);
+        if let Some(tex) = &self.original_texture {
+            ui.painter_at(left).image(
+                tex.id(),
+                img_rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        let painter = ui.painter_at(area);
+        painter.line_segment(
+            [pos2(split_x, img_rect.min.y), pos2(split_x, img_rect.max.y)],
+            Stroke::new(2.0_f32, Color32::WHITE),
+        );
+        let label_y = img_rect.min.y.max(area.min.y) + 6.0;
+        let font = FontId::proportional(13.0);
+        painter.text(pos2(split_x - 6.0, label_y), Align2::RIGHT_TOP, "Original", font.clone(), Color32::WHITE);
+        painter.text(pos2(split_x + 6.0, label_y), Align2::LEFT_TOP, "Sorted", font, Color32::WHITE);
+    }
+
     /// Paints into the mask of the current layer with the mouse and draws the mask overlay and the brush
-    fn mask_painting(&mut self, ui: &mut Ui, response: &Response) {
+    fn mask_painting(&mut self, ui: &mut Ui, response: &Response, rect: Rect, area: Rect) {
         let Some(ls) = &mut self.layered_sorter else { return };
         let (w, h) = ls.get_base_img().dimensions();
-        let rect = response.rect;
         if w == 0 || h == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
@@ -576,7 +684,8 @@ impl PixelsorterGui {
         });
 
         // Start a stroke when a mouse button is pressed on the image, end it when all buttons are released
-        if any_pressed && response.hovered() {
+        // (the middle button moves the view)
+        if any_pressed && response.hovered() && (primary_down || secondary_down) {
             self.mask_stroke_active = true;
             self.last_brush_pos = None;
         }
@@ -670,7 +779,7 @@ impl PixelsorterGui {
         // Draw the overlay
         if self.show_mask_overlay {
             if let Some(tex) = &self.mask_texture {
-                ui.painter().image(
+                ui.painter_at(area).image(
                     tex.id(),
                     rect,
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -696,12 +805,11 @@ impl PixelsorterGui {
     }
 
     /// Sets the center of rays, circles and spirals with a click on the image
-    fn center_picking(&mut self, ui: &mut Ui, response: &Response) {
-        let rect = response.rect;
+    fn center_picking(&mut self, ui: &mut Ui, response: &Response, rect: Rect) {
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
-        let painter = ui.painter();
+        let painter = ui.painter_at(response.rect);
         // Crosshair at the mouse
         if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(p) {
@@ -809,37 +917,148 @@ impl PixelsorterGui {
             let file = filedialog.pick_file();
             match file {
                 None => break,
-                Some(f) => match image::open(f.as_path()) {
-                    Ok(i) => {
-                        let img = i.into_rgb8();
-                        if let Some(ls) = &mut self.layered_sorter {
-                            ls.set_base_img(img.clone());
-                        }
-                        self.mask_texture_dirty = true;
-                        // Results of a running background sort belong to the old image
-                        self.sort_generation += 1;
-                        self.background_pending = None;
-                        // I want to make layered_sorter mandatory and remove the possibility of it being None
-                        #[cfg(feature = "video")] {
-                            self.video_player = None;
-                        }
-                        self.img = Some(img);
-                        self.update_texture(ctx);
-                        self.path = Some(f);
+                Some(f) => {
+                    if self.open_path(ctx, f) {
                         break;
                     }
-                    Err(_) => {
-                        #[cfg(feature = "video")]
-                        if self.init_video(ctx, &f).is_ok() {
-                            // TODO: Either use layered sorter or save it for the next loaded image
-                            self.layered_sorter = None;
-                            self.img = None;
-                            self.path = Some(f);
-                            break;
-                        }
-                    }
-                },
+                }
             }
+        }
+    }
+
+    /// Opens an image (or a video) from a path. Returns false if it couldn't be opened.
+    fn open_path(&mut self, ctx: &egui::Context, f: PathBuf) -> bool {
+        match image::open(f.as_path()) {
+            Ok(i) => {
+                let img = i.into_rgb8();
+                if let Some(ls) = &mut self.layered_sorter {
+                    ls.set_base_img(img.clone());
+                }
+                self.mask_texture_dirty = true;
+                self.original_texture = None;
+                // Results of a running background sort belong to the old image
+                self.sort_generation += 1;
+                self.background_pending = None;
+                // A new image: the history and the view start fresh
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.undo_current = None;
+                self.view_zoom = 1.0;
+                self.view_pan = Vec2::ZERO;
+                // I want to make layered_sorter mandatory and remove the possibility of it being None
+                #[cfg(feature = "video")] {
+                    self.video_player = None;
+                }
+                self.img = Some(img);
+                self.update_texture(ctx);
+                self.path = Some(f);
+                self.do_sort = true;
+                true
+            }
+            Err(e) => {
+                #[cfg(feature = "video")]
+                if self.init_video(ctx, &f).is_ok() {
+                    // TODO: Either use layered sorter or save it for the next loaded image
+                    self.layered_sorter = None;
+                    self.img = None;
+                    self.path = Some(f);
+                    return true;
+                }
+                warn!("Could not open '{}': {}", f.to_string_lossy(), e);
+                false
+            }
+        }
+    }
+
+    /// Handles files dropped onto the window and shows a hint while a file is dragged over it
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let (dropped, hovering) = ctx.input(|i| {
+            (
+                i.raw.dropped_files.iter().find_map(|f| f.path.clone()),
+                !i.raw.hovered_files.is_empty(),
+            )
+        });
+        if let Some(path) = dropped {
+            self.open_path(ctx, path);
+        }
+        if hovering {
+            let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file-drop-overlay")));
+            let screen = ctx.screen_rect();
+            painter.rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+            painter.text(
+                screen.center(),
+                Align2::CENTER_CENTER,
+                "Drop the image to open it",
+                FontId::proportional(28.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    /// Adds an undo entry when the layers changed (not while the mouse is held, so a slider drag is one entry)
+    fn track_undo(&mut self, ctx: &egui::Context) {
+        const MAX_UNDO: usize = 40;
+        let Some(ls) = &self.layered_sorter else { return };
+        if self.mask_stroke_active || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        match &self.undo_current {
+            None => self.undo_current = Some(ls.snapshot(None)),
+            Some(current) => {
+                if !ls.matches_snapshot(current) {
+                    let new = ls.snapshot(Some(current));
+                    let old = self.undo_current.replace(new).unwrap();
+                    self.undo_stack.push(old);
+                    if self.undo_stack.len() > MAX_UNDO {
+                        self.undo_stack.remove(0);
+                    }
+                    self.redo_stack.clear();
+                }
+            }
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.undo_stack.pop() {
+            if let Some(current) = self.undo_current.take() {
+                self.redo_stack.push(current);
+            }
+            self.restore_snapshot(previous);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            if let Some(current) = self.undo_current.take() {
+                self.undo_stack.push(current);
+            }
+            self.restore_snapshot(next);
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: StackSnapshot) {
+        if let Some(ls) = &mut self.layered_sorter {
+            ls.restore(&snapshot);
+            self.undo_current = Some(snapshot);
+            self.values = ls.get_current_layer().get_sorting_values().clone();
+            // Results of running sorts belong to the old state
+            self.sort_generation += 1;
+            self.background_pending = None;
+            self.mask_texture_dirty = true;
+            self.show_base_image = false;
+            self.do_sort = true;
+        }
+    }
+
+    /// Sets new values for the current layer from outside the options panel (presets, random)
+    fn set_values(&mut self, values: PixelsorterValues) {
+        self.values = values;
+        if let Some(ls) = &mut self.layered_sorter {
+            // The values are read back from the layer every frame, so write them there
+            ls.update_current(values);
+        }
+        if self.auto_sort {
+            self.do_sort = true;
         }
     }
 
@@ -932,6 +1151,8 @@ impl PixelsorterGui {
 impl eframe::App for PixelsorterGui {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let mut do_open_file = false;
+        let mut do_undo = false;
+        let mut do_redo = false;
         // Shortcuts
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::S) {
@@ -947,6 +1168,17 @@ impl eframe::App for PixelsorterGui {
             }
             if i.consume_key(Modifiers::NONE, Key::B) {
                 self.mask_edit = !self.mask_edit;
+            }
+            if i.consume_key(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Z) || i.consume_key(Modifiers::CTRL, Key::Y) {
+                do_redo = true;
+            }
+            if i.consume_key(Modifiers::CTRL, Key::Z) {
+                do_undo = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::F) {
+                // Fit the image into the window again
+                self.view_zoom = 1.0;
+                self.view_pan = Vec2::ZERO;
             }
             if i.consume_key(Modifiers::NONE, Key::M) {
                 self.show_mask = !self.show_mask;
@@ -966,6 +1198,13 @@ impl eframe::App for PixelsorterGui {
         // Open file on startup
         if do_open_file {
             self.open_file_dialog(ctx);
+        }
+        self.handle_dropped_files(ctx);
+        if do_undo {
+            self.undo();
+        }
+        if do_redo {
+            self.redo();
         }
 
         // Load video if no image is set
@@ -1079,8 +1318,8 @@ impl eframe::App for PixelsorterGui {
         let prev_values = (self.values.clone(), self.show_mask);
         egui::SidePanel::left("my-left-pane")
             .resizable(false)
-            //.exact_width(380.0)
-            .max_width(380.0)
+            // A fixed width: egui would otherwise remember the narrow default width (200 px)
+            .exact_width(380.0)
             .show(ctx, |ui| {
                 ui.add_space(5.0);
                 // Limit the width: content that is too wide must not push the image to the right
@@ -1100,8 +1339,36 @@ impl eframe::App for PixelsorterGui {
                             if let Some(p) = &self.path {
                                 ui.label(RichText::new(p.to_string_lossy()));
                             } else {
-                                ui.label(RichText::new("No image loaded...").italics());
+                                ui.label(RichText::new("No image loaded... (or drop one into the window)").italics());
                             }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(!self.undo_stack.is_empty(), Button::new("Undo"))
+                                    .on_hover_text("Ctrl+Z")
+                                    .clicked()
+                                {
+                                    self.undo();
+                                }
+                                if ui
+                                    .add_enabled(!self.redo_stack.is_empty(), Button::new("Redo"))
+                                    .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
+                                    .clicked()
+                                {
+                                    self.redo();
+                                }
+                                ui.separator();
+                                ui.checkbox(&mut self.compare, "Compare")
+                                    .on_hover_text("Original left, sorted right. Drag on the image to move the divider");
+                                if ui
+                                    .button("Fit")
+                                    .on_hover_text("Fit the image into the window [F]. Zoom: mouse wheel, move: middle mouse button")
+                                    .clicked()
+                                {
+                                    self.view_zoom = 1.0;
+                                    self.view_pan = Vec2::ZERO;
+                                }
+                                ui.label(RichText::new(format!("{:.0}%", self.view_zoom * 100.0)).small());
+                            });
                         });
 
                         ui.add_space(5.0);
@@ -1109,6 +1376,11 @@ impl eframe::App for PixelsorterGui {
                         // SLIDERS AND BUTTONS AND STUFF
                         ui.group(|ui| {
                             self.sorting_options_panel(ui, 1);
+                        });
+
+                        ui.add_space(5.0);
+                        ui.group(|ui| {
+                            self.presets_panel(ui);
                         });
 
                         ui.add_space(5.0);
@@ -1188,6 +1460,7 @@ impl eframe::App for PixelsorterGui {
             // Write any changes back to the layered sorter
             ls.update_current(self.values.clone());
         }
+        self.track_undo(ctx);
 
         // Auto-Sort current image on changes or if image needs sorting
         let values_changed = self.values != prev_values.0 || self.show_mask != prev_values.1;

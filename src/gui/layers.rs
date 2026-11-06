@@ -9,6 +9,25 @@ pub(crate) struct LayeredSorter {
     base_img: RgbImage,
     layers: Vec<SortingLayer>,
     current_layer: usize,
+    /// Source of unique mask revisions (never repeats, also not after undo)
+    revision_counter: u64,
+}
+
+/// The state of one layer, for undo/redo (without the sorted image, that is sorted again)
+#[derive(Clone)]
+pub(crate) struct LayerSnapshot {
+    values: PixelsorterValues,
+    paint_mask: Option<Arc<GrayImage>>,
+    guide: Option<Arc<GrayImage>>,
+    directions: Option<Arc<Vec<f32>>>,
+    revision: u64,
+}
+
+/// The state of all layers, for undo/redo
+#[derive(Clone)]
+pub(crate) struct StackSnapshot {
+    layers: Vec<LayerSnapshot>,
+    current: usize,
 }
 
 pub(crate) struct SortingLayer {
@@ -71,6 +90,7 @@ impl LayeredSorter {
             base_img: img,
             layers: Vec::new(),
             current_layer: 0,
+            revision_counter: 0,
         };
         ls.add_layer(ps);
         ls
@@ -98,7 +118,8 @@ impl LayeredSorter {
                 layer.paint_mask = None;
                 layer.guide = None;
                 layer.directions = None;
-                layer.mask_revision += 1;
+                self.revision_counter += 1;
+                layer.mask_revision = self.revision_counter;
             }
         }
         self.base_img = img;
@@ -230,10 +251,73 @@ impl LayeredSorter {
 
     /// Marks the current layer (and all above) as needing a sort, because its mask changed
     pub(crate) fn paint_mask_changed(&mut self) {
+        self.revision_counter += 1;
         let layer = self.layers.get_mut(self.current_layer).unwrap();
-        layer.mask_revision += 1;
+        layer.mask_revision = self.revision_counter;
         layer.needs_sorting = true;
         self.invalidate_layers_above(self.current_layer, false);
+    }
+
+    /// Saves the state of all layers for undo/redo.
+    /// Masks that didn't change since `previous` are shared with it instead of copied.
+    pub(crate) fn snapshot(&self, previous: Option<&StackSnapshot>) -> StackSnapshot {
+        StackSnapshot {
+            current: self.current_layer,
+            layers: self
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let unchanged = previous.and_then(|p| p.layers.get(i)).filter(|p| p.revision == l.mask_revision);
+                    LayerSnapshot {
+                        values: l.sorting_values,
+                        paint_mask: match unchanged {
+                            Some(p) => p.paint_mask.clone(),
+                            None => l.paint_mask.clone().map(Arc::new),
+                        },
+                        guide: match unchanged {
+                            Some(p) => p.guide.clone(),
+                            None => l.guide.clone().map(Arc::new),
+                        },
+                        directions: l.directions.clone(),
+                        revision: l.mask_revision,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Is the state of the layers (not counting which one is selected) the one in the snapshot?
+    pub(crate) fn matches_snapshot(&self, snapshot: &StackSnapshot) -> bool {
+        self.layers.len() == snapshot.layers.len()
+            && self
+                .layers
+                .iter()
+                .zip(snapshot.layers.iter())
+                .all(|(l, s)| l.sorting_values == s.values && l.mask_revision == s.revision)
+    }
+
+    /// Goes back to a saved state. All layers have to be sorted again.
+    pub(crate) fn restore(&mut self, snapshot: &StackSnapshot) {
+        if snapshot.layers.is_empty() {
+            return;
+        }
+        let base = &self.base_img;
+        self.layers = snapshot
+            .layers
+            .iter()
+            .map(|s| SortingLayer {
+                sorting_values: s.values,
+                sorted_img: base.clone(),
+                needs_sorting: true,
+                paint_mask: s.paint_mask.as_deref().cloned(),
+                // Same content as when the snapshot was taken, so the same revision
+                mask_revision: s.revision,
+                guide: s.guide.as_deref().cloned(),
+                directions: s.directions.clone(),
+            })
+            .collect();
+        self.current_layer = snapshot.current.min(self.layers.len() - 1);
     }
 
     pub(crate) fn print_state(&self) {

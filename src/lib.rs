@@ -12,6 +12,7 @@ use crate::pixel_selector::PixelSelector;
 mod color_helpers;
 pub mod path_creator;
 pub mod pixel_selector;
+mod preset;
 pub mod span_sorter;
 #[cfg(feature = "video")]
 mod video;

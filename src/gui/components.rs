@@ -589,6 +589,145 @@ impl PixelsorterGui {
             });
     }
 
+    /// The settings of the current layer as preset text (including blend mode and opacity)
+    fn current_preset_text(&self) -> String {
+        format!(
+            "{};blend={:?};opacity={}",
+            self.values.to_pixelsorter().to_preset_string(),
+            self.values.blend,
+            self.values.opacity
+        )
+    }
+
+    /// Applies preset text to the current layer. Returns an error message if it can't be read.
+    fn apply_preset_text(&mut self, text: &str) -> Result<(), String> {
+        let ps = Pixelsorter::from_preset_string(text)?;
+        let mut values = self.values;
+        values.read_from_pixelsorter(&ps);
+        // The layer settings that only the gui knows
+        values.blend = BlendMode::Normal;
+        values.opacity = 1.0;
+        for part in text.split(';') {
+            if let Some((key, value)) = part.split_once('=') {
+                match key.trim() {
+                    "blend" => {
+                        if let Some(mode) = BlendMode::ALL.iter().find(|m| format!("{:?}", m).eq_ignore_ascii_case(value.trim())) {
+                            values.blend = *mode;
+                        }
+                    }
+                    "opacity" => values.opacity = value.trim().parse().unwrap_or(1.0),
+                    _ => {}
+                }
+            }
+        }
+        self.set_values(values);
+        Ok(())
+    }
+
+    pub(super) fn presets_panel(&mut self, ui: &mut Ui) {
+        ui.set_width(full_width(&ui));
+        let enabled = self.layered_sorter.is_some();
+        egui::CollapsingHeader::new(important_text("Presets"))
+            .id_salt("presets_header")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    // Saved presets
+                    ui.horizontal(|ui| {
+                        let selected_name = self
+                            .selected_preset
+                            .and_then(|i| self.presets.get(i))
+                            .map(|p| p.0.clone())
+                            .unwrap_or_else(|| "Choose a preset...".to_string());
+                        egui::ComboBox::from_id_salt("preset_combo")
+                            .selected_text(selected_name)
+                            .width(170.0)
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                for (i, (name, _)) in self.presets.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected_preset, Some(i), name);
+                                }
+                            });
+                        let selected = self.selected_preset.filter(|&i| i < self.presets.len());
+                        if ui.add_enabled(selected.is_some(), Button::new("Apply")).clicked() {
+                            if let Some(i) = selected {
+                                let text = self.presets[i].1.clone();
+                                if let Err(e) = self.apply_preset_text(&text) {
+                                    warn!("Invalid preset '{}': {}", self.presets[i].0, e);
+                                }
+                            }
+                        }
+                        if ui.add_enabled(selected.is_some(), Button::new("Delete")).clicked() {
+                            if let Some(i) = selected {
+                                self.presets.remove(i);
+                                self.selected_preset = None;
+                                presets::save_presets(&self.presets);
+                            }
+                        }
+                    });
+                    // Save the current settings
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("Name").desired_width(170.0));
+                        let name = presets::clean_name(&self.preset_name);
+                        if ui
+                            .add_enabled(!name.is_empty(), Button::new("Save"))
+                            .on_hover_text("Save the settings of this layer (a preset with the same name is replaced)")
+                            .clicked()
+                        {
+                            let text = self.current_preset_text();
+                            match self.presets.iter().position(|p| p.0 == name) {
+                                Some(i) => {
+                                    self.presets[i].1 = text;
+                                    self.selected_preset = Some(i);
+                                }
+                                None => {
+                                    self.presets.push((name, text));
+                                    self.selected_preset = Some(self.presets.len() - 1);
+                                }
+                            }
+                            presets::save_presets(&self.presets);
+                            self.preset_name.clear();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Random")
+                            .on_hover_text("Random settings for this layer. Ctrl+Z goes back")
+                            .clicked()
+                        {
+                            let mut ps = self.values.to_pixelsorter();
+                            ps.randomize();
+                            let mut values = self.values;
+                            values.read_from_pixelsorter(&ps);
+                            self.set_values(values);
+                        }
+                        if ui
+                            .button("Copy as text")
+                            .on_hover_text("Copy the settings, e.g. for the command line: --preset \"...\"")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(self.current_preset_text());
+                        }
+                    });
+                    // Settings text, e.g. copied from someone else
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.preset_text)
+                                .hint_text("Paste settings text here")
+                                .desired_width(170.0),
+                        );
+                        if ui.add_enabled(!self.preset_text.trim().is_empty(), Button::new("Apply")).clicked() {
+                            let text = self.preset_text.trim().to_string();
+                            match self.apply_preset_text(&text) {
+                                Ok(()) => self.preset_text.clear(),
+                                Err(e) => warn!("Invalid settings text: {}", e),
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
     pub(super) fn mask_panel(&mut self, ui: &mut Ui) {
         ui.set_width(full_width(&ui));
         let enabled = self.layered_sorter.is_some();

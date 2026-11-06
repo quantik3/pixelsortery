@@ -79,6 +79,7 @@ const HELP_STRING: &str = "
 
    --show-mask    : Outputs a mask showing what areas would be sorted (requires --thres)
    --mask <FILE>  : Only sort where this black/white image is white (must have the image size)
+   --preset <TEXT>: Use settings copied from a preset (path=...;selector=...;...). Options after it change it further
    --gui          : Starts the gui;
                     | When using the gui, setting <output> is optional
    [VIDEO]
@@ -196,6 +197,16 @@ fn main() {
 
             "--gui" => start_gui = true,
             "--show-mask" => show_mask = true,
+            "--preset" => {
+                let text = parse_parameter::<String>(args.pop_front(), "--preset <TEXT>");
+                match pixelsortery::Pixelsorter::from_preset_string(&text) {
+                    Ok(preset) => ps = preset,
+                    Err(e) => {
+                        eprintln!("Invalid preset: {}", e);
+                        exit(-1);
+                    }
+                }
+            }
             "--mask" => paint_mask_path = Some(parse_parameter::<String>(args.pop_front(), "--mask <FILE>")),
 
             #[cfg(feature = "video")]
