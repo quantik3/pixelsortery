@@ -1,4 +1,5 @@
 use image::{GrayImage, Luma, RgbImage};
+use std::sync::Arc;
 use pixelsortery::Pixelsorter;
 
 use super::blend::render_layer;
@@ -21,6 +22,9 @@ pub(crate) struct SortingLayer {
     mask_revision: u64,
     /// Guide image (brightness, same size as the image) for the criteria "Guide"
     guide: Option<GrayImage>,
+    /// Painted directions for the path "Drawn": one angle per pixel, NaN = not painted.
+    /// Shared with background sorts, so starting one doesn't copy it.
+    directions: Option<Arc<Vec<f32>>>,
 }
 
 /// Everything needed to sort some layers in a background thread
@@ -29,8 +33,8 @@ pub(crate) struct SortJob {
     pub(crate) start: usize,
     /// The image the first layer is applied to
     input: RgbImage,
-    /// Values, mask and guide for every layer from `start` up to the current layer
-    steps: Vec<(PixelsorterValues, Option<GrayImage>, Option<GrayImage>)>,
+    /// Values, mask, guide and directions for every layer from `start` up to the current layer
+    steps: Vec<(PixelsorterValues, Option<GrayImage>, Option<GrayImage>, Option<Arc<Vec<f32>>>)>,
     /// Values and mask revisions the job was created with
     checks: Vec<(PixelsorterValues, u64)>,
 }
@@ -40,8 +44,8 @@ impl SortJob {
     pub(crate) fn run(self) -> SortJobResult {
         let mut results = Vec::with_capacity(self.steps.len());
         let mut img = self.input;
-        for (values, mask, guide) in &self.steps {
-            img = values.render(&img, mask.as_ref(), guide.as_ref());
+        for (values, mask, guide, directions) in &self.steps {
+            img = values.render(&img, mask.as_ref(), guide.as_ref(), directions.as_deref().map(|d| d.as_slice()));
             results.push(img.clone());
         }
         SortJobResult { start: self.start, images: results, checks: self.checks }
@@ -93,6 +97,7 @@ impl LayeredSorter {
             for layer in self.layers.iter_mut() {
                 layer.paint_mask = None;
                 layer.guide = None;
+                layer.directions = None;
                 layer.mask_revision += 1;
             }
         }
@@ -144,7 +149,7 @@ impl LayeredSorter {
             input,
             steps: layers
                 .iter()
-                .map(|l| (l.sorting_values, l.paint_mask.clone(), l.guide.clone()))
+                .map(|l| (l.sorting_values, l.paint_mask.clone(), l.guide.clone(), l.directions.clone()))
                 .collect(),
             checks: layers.iter().map(|l| (l.sorting_values, l.mask_revision)).collect(),
         })
@@ -182,6 +187,34 @@ impl LayeredSorter {
             // Same handling as a changed mask: sort again, outdated results are dropped
             self.paint_mask_changed();
         }
+    }
+
+    /// The painted directions of the current layer (one angle per pixel, NaN = not painted)
+    pub(crate) fn get_current_directions(&self) -> Option<&[f32]> {
+        self.get_current_layer().directions.as_deref().map(|d| d.as_slice())
+    }
+
+    /// The painted directions of the current layer, created (nothing painted) if there are none yet.
+    /// Call `paint_mask_changed` after changing them.
+    pub(crate) fn get_current_directions_mut(&mut self) -> &mut Vec<f32> {
+        let (w, h) = self.base_img.dimensions();
+        let n = (w as usize) * (h as usize);
+        let layer = self.layers.get_mut(self.current_layer).unwrap();
+        if layer.directions.as_ref().map(|d| d.len() != n).unwrap_or(true) {
+            layer.directions = Some(Arc::new(vec![f32::NAN; n]));
+        }
+        // Copies the directions only if a background sort is still using them
+        Arc::make_mut(layer.directions.as_mut().unwrap())
+    }
+
+    /// Removes the painted directions of the current layer
+    pub(crate) fn clear_current_directions(&mut self) {
+        self.layers.get_mut(self.current_layer).unwrap().directions = None;
+        self.paint_mask_changed();
+    }
+
+    pub(crate) fn has_current_directions(&self) -> bool {
+        self.get_current_layer().directions.is_some()
     }
 
     /// Size of the image
@@ -344,6 +377,7 @@ impl SortingLayer {
             paint_mask: None,
             mask_revision: 0,
             guide: None,
+            directions: None,
         }
     }
 
@@ -371,7 +405,12 @@ impl SortingLayer {
     }
 
     fn sort(&mut self, img: &RgbImage) {
-        self.sorted_img = self.sorting_values.render(img, self.paint_mask.as_ref(), self.guide.as_ref());
+        self.sorted_img = self.sorting_values.render(
+            img,
+            self.paint_mask.as_ref(),
+            self.guide.as_ref(),
+            self.directions.as_deref().map(|d| d.as_slice()),
+        );
         self.needs_sorting = false;
     }
 
@@ -386,7 +425,13 @@ impl SortingLayer {
 
 impl PixelsorterValues {
     /// Sorts the image with these values and blends the result over it (blend mode, opacity, mask)
-    pub(crate) fn render(&self, img: &RgbImage, mask: Option<&GrayImage>, guide: Option<&GrayImage>) -> RgbImage {
-        render_layer(&self.to_pixelsorter(), self.blend, self.opacity, img, mask, guide)
+    pub(crate) fn render(
+        &self,
+        img: &RgbImage,
+        mask: Option<&GrayImage>,
+        guide: Option<&GrayImage>,
+        directions: Option<&[f32]>,
+    ) -> RgbImage {
+        render_layer(&self.to_pixelsorter(), self.blend, self.opacity, img, mask, guide, directions)
     }
 }

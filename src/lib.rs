@@ -286,12 +286,25 @@ impl Pixelsorter {
     /// the pixels are sorted by the brightness of the guide image at their position.
     /// Mask and guide are ignored if their size differs from the image.
     pub fn sort_with_mask_and_guide(&self, img: &mut RgbImage, mask: Option<&GrayImage>, guide: Option<&GrayImage>) {
+        self.sort_with_extras(img, mask, guide, None);
+    }
+
+    /// Like `sort_with_mask_and_guide`, with painted directions for the path `PathCreator::Drawn`
+    /// (one angle in radians per pixel, NaN = not painted).
+    pub fn sort_with_extras(
+        &self,
+        img: &mut RgbImage,
+        mask: Option<&GrayImage>,
+        guide: Option<&GrayImage>,
+        directions: Option<&[f32]>,
+    ) {
         let (w, h) = (img.width(), img.height());
         let fits = |m: &&GrayImage| m.width() == w && m.height() == h;
         let mask = mask.filter(fits).map(|m| m.as_raw().as_slice());
         let guide = guide.filter(fits).map(|m| m.as_raw().as_slice());
+        let directions = directions.filter(|d| d.len() == (w as usize) * (h as usize));
         let raw: &mut [u8] = img;
-        self.sort_raw_with_guide(raw, 3, w as u64, h as u64, mask, guide);
+        self.sort_raw_full(raw, 3, w as u64, h as u64, mask, guide, directions);
     }
 
     /// Sort raw pixel data in place.
@@ -305,6 +318,20 @@ impl Pixelsorter {
 
     /// Like `sort_raw`, with an optional guide (one brightness byte per pixel), see `sort_with_mask_and_guide`.
     pub fn sort_raw_with_guide(&self, raw: &mut [u8], channels: usize, w: u64, h: u64, mask: Option<&[u8]>, guide: Option<&[u8]>) {
+        self.sort_raw_full(raw, channels, w, h, mask, guide, None);
+    }
+
+    /// Sort raw pixel data with all optional inputs (see `sort_raw` and `sort_with_extras`)
+    pub fn sort_raw_full(
+        &self,
+        raw: &mut [u8],
+        channels: usize,
+        w: u64,
+        h: u64,
+        mask: Option<&[u8]>,
+        guide: Option<&[u8]>,
+        directions: Option<&[f32]>,
+    ) {
         let pixelcount = (w * h) as usize;
         let guide = guide.filter(|g| g.len() >= pixelcount && self.sorter.criteria == SortingCriteria::Guide);
         let single_channel = self.channels.single_channel();
@@ -323,7 +350,7 @@ impl Pixelsorter {
 
         // CUT IMAGE INTO PATHS (lists of pixel indices that never overlap)
         let mut timestart = Instant::now();
-        let paths = self.path_creator.create_index_paths(w, h, self.reverse, mask, self.path_center);
+        let paths = self.path_creator.create_index_paths(w, h, self.reverse, mask, self.path_center, directions);
         info!("TIME [Creating Paths]:\t{:?}", timestart.elapsed());
         timestart = Instant::now();
 

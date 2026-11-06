@@ -59,6 +59,7 @@ pub(crate) fn render_layer(
     input: &RgbImage,
     mask: Option<&GrayImage>,
     guide: Option<&GrayImage>,
+    directions: Option<&[f32]>,
 ) -> RgbImage {
     let mask = mask.filter(|m| m.dimensions() == input.dimensions());
     let soft = mask.map(|m| m.as_raw().iter().any(|&v| v != 0 && v != 255)).unwrap_or(false);
@@ -75,7 +76,7 @@ pub(crate) fn render_layer(
     };
 
     let mut sorted = input.clone();
-    ps.sort_with_mask_and_guide(&mut sorted, sort_mask.as_ref().or(mask), guide);
+    ps.sort_with_extras(&mut sorted, sort_mask.as_ref().or(mask), guide, directions);
 
     let opacity = opacity.clamp(0.0, 1.0);
     if blend == BlendMode::Normal && opacity >= 1.0 && !soft {

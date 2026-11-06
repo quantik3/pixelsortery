@@ -24,6 +24,9 @@ pub enum PathCreator {
     Waves(f32, f32, bool),
     /// Lines that follow a swirling noise field: (size of the swirls in pixels, random seed)
     FlowField(f32, u32),
+    /// Lines along directions painted with the direction brush (stored outside, see `create_index_paths`).
+    /// Between the brush strokes the directions blend smoothly. Without any strokes: vertical lines.
+    Drawn,
     /// Rings shaped like a star around the center: (number of points, inner radius 0-1).
     /// With an inner radius of cos(180°/points) the star becomes a regular polygon.
     Star(u32, f32),
@@ -51,6 +54,7 @@ impl std::fmt::Display for PathCreator {
                 PathCreator::Hilbert => "Hilbert Curve".into(),
                 PathCreator::X3(_, _, _) => "x³".into(),
                 PathCreator::FlowField(scale, seed) => format!("Flow Field ({}/{})", scale, seed),
+                PathCreator::Drawn => "Drawn".into(),
                 PathCreator::Star(points, inner) => format!("Star ({}/{:.2})", points, inner),
                 PathCreator::Waves(a, l, horizontal) => format!(
                     "Waves {} ({}/{})",
@@ -83,7 +87,10 @@ impl PathCreator {
 
     /// Creates the raw index paths (may contain invalid or duplicate indices).
     /// `center` is relative to the image size ((0.5, 0.5) is the middle).
-    fn index_paths(self, w: u64, h: u64, center: (f32, f32)) -> Vec<Vec<u64>> {
+    fn index_paths(self, w: u64, h: u64, center: (f32, f32), directions: Option<&[f32]>) -> Vec<Vec<u64>> {
+        if self == PathCreator::Drawn {
+            return path_drawn(w, h, directions);
+        }
         // New paths that always use the center
         if let PathCreator::Star(points, inner) = self {
             let cx = center.0.clamp(0.0, 1.0) as f64 * w as f64;
@@ -122,7 +129,7 @@ impl PathCreator {
             PathCreator::Waves(amplitude, wavelength, horizontal) => path_waves(w, h, amplitude, wavelength, horizontal),
             PathCreator::FlowField(scale, seed) => path_flow_field(w, h, scale, seed),
             // Handled above
-            PathCreator::Star(..) => Vec::new(),
+            PathCreator::Star(..) | PathCreator::Drawn => Vec::new(),
         }
     }
     pub fn create_paths(self, all_pixels: Vec<&mut Rgb<u8>>, w: u64, h: u64, reverse: bool) -> Vec<Vec<&mut Rgb<u8>>> {
@@ -134,7 +141,7 @@ impl PathCreator {
         // Ideas/missing:
         // In waves
         // In star shape
-        let mut all_paths_indices = self.index_paths(w, h, DEFAULT_CENTER);
+        let mut all_paths_indices = self.index_paths(w, h, DEFAULT_CENTER, None);
         let timeend_pathing = timestart.elapsed();
         timestart = Instant::now();
 
@@ -170,9 +177,19 @@ impl PathCreator {
     /// If a mask is given (one byte per pixel), only pixels with a mask value >= 128 are sorted.
     /// Pixels outside the mask are left untouched and split a path into separate parts,
     /// so no pixel is ever moved across an unmasked area.
-    pub fn create_index_paths(self, w: u64, h: u64, reverse: bool, mask: Option<&[u8]>, center: (f32, f32)) -> Vec<Vec<u64>> {
+    ///
+    /// `directions` (one angle in radians per pixel, NaN = not painted) is only used by `PathCreator::Drawn`.
+    pub fn create_index_paths(
+        self,
+        w: u64,
+        h: u64,
+        reverse: bool,
+        mask: Option<&[u8]>,
+        center: (f32, f32),
+        directions: Option<&[f32]>,
+    ) -> Vec<Vec<u64>> {
         let total_timestart = Instant::now();
-        let mut all_paths_indices = self.index_paths(w, h, center);
+        let mut all_paths_indices = self.index_paths(w, h, center, directions);
         let timeend_pathing = total_timestart.elapsed();
 
         // Reverse spans if nessesary
@@ -805,9 +822,7 @@ fn flow_angle(x: f32, y: f32, scale: f32, seed: u32) -> f32 {
 
 /// Lines that follow a swirling noise field. Every pixel belongs to exactly one line.
 fn path_flow_field(w: u64, h: u64, scale: f32, seed: u32) -> Vec<Vec<u64>> {
-    const MAX_LENGTH: usize = 4096;
     let scale = scale.abs().max(1.0);
-    let n = (w * h) as usize;
     // Direction (step in x and y) at every pixel
     let directions: Vec<(f32, f32)> = (0..h)
         .into_par_iter()
@@ -822,43 +837,7 @@ fn path_flow_field(w: u64, h: u64, scale: f32, seed: u32) -> Vec<Vec<u64>> {
         .flatten()
         .collect();
 
-    let mut visited = vec![false; n];
-    let mut paths = Vec::new();
-    for start in 0..n {
-        if visited[start] {
-            continue;
-        }
-        visited[start] = true;
-        let mut path = vec![start as u64];
-        let (mut fx, mut fy) = ((start as u64 % w) as f32 + 0.5, (start as u64 / w) as f32 + 0.5);
-        let mut last = start;
-        let mut steps_in_same_pixel = 0;
-        while path.len() < MAX_LENGTH {
-            let (dx, dy) = directions[last];
-            fx += dx;
-            fy += dy;
-            if fx < 0.0 || fy < 0.0 || fx >= w as f32 || fy >= h as f32 {
-                break;
-            }
-            let i = (fy as u64 * w + fx as u64) as usize;
-            if i == last {
-                steps_in_same_pixel += 1;
-                if steps_in_same_pixel > 3 {
-                    break;
-                }
-                continue;
-            }
-            steps_in_same_pixel = 0;
-            if visited[i] {
-                break;
-            }
-            visited[i] = true;
-            path.push(i as u64);
-            last = i;
-        }
-        paths.push(path);
-    }
-    paths
+    trace_streamlines(w, h, &directions)
 }
 
 /// Rings shaped like a star (or a polygon) around (cx, cy). Each ring starts at the top and goes clockwise.
@@ -911,4 +890,185 @@ fn path_star(w: u64, h: u64, cx: f64, cy: f64, points: u32, inner: f32) -> Vec<V
         .filter(|ring| !ring.is_empty())
         .map(|ring| ring.into_iter().map(|(_, i)| i as u64).collect())
         .collect()
+}
+
+
+/// Follows the direction field from every pixel that isn't part of a line yet, forwards and backwards.
+/// Every pixel ends up in exactly one line.
+fn trace_streamlines(w: u64, h: u64, directions: &[(f32, f32)]) -> Vec<Vec<u64>> {
+    const MAX_LENGTH: usize = 4096;
+    let n = (w * h) as usize;
+    let mut visited = vec![false; n];
+    let mut paths = Vec::new();
+
+    // Follows the field from `start` (forwards for sign = 1, backwards for sign = -1)
+    let mut trace = |start: usize, sign: f32, visited: &mut Vec<bool>| -> Vec<u64> {
+        let mut line = Vec::new();
+        let (mut fx, mut fy) = ((start as u64 % w) as f32 + 0.5, (start as u64 / w) as f32 + 0.5);
+        let mut last = start;
+        let mut steps_in_same_pixel = 0;
+        while line.len() < MAX_LENGTH {
+            let (dx, dy) = directions[last];
+            fx += sign * dx;
+            fy += sign * dy;
+            if fx < 0.0 || fy < 0.0 || fx >= w as f32 || fy >= h as f32 {
+                break;
+            }
+            let i = (fy as u64 * w + fx as u64) as usize;
+            if i == last {
+                steps_in_same_pixel += 1;
+                if steps_in_same_pixel > 3 {
+                    break;
+                }
+                continue;
+            }
+            steps_in_same_pixel = 0;
+            if visited[i] {
+                break;
+            }
+            visited[i] = true;
+            line.push(i as u64);
+            last = i;
+        }
+        line
+    };
+
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        // Go backwards to where the line comes from, then forwards
+        let mut path = trace(start, -1.0, &mut visited);
+        path.reverse();
+        path.push(start as u64);
+        path.extend(trace(start, 1.0, &mut visited));
+        paths.push(path);
+    }
+    paths
+}
+
+/// Lines along painted directions. Unpainted areas get smoothly blended directions from the strokes around them.
+fn path_drawn(w: u64, h: u64, directions: Option<&[f32]>) -> Vec<Vec<u64>> {
+    let n = (w * h) as usize;
+    match directions.filter(|d| d.len() >= n).and_then(|d| fill_direction_field(w, h, d)) {
+        Some(field) => trace_streamlines(w, h, &field),
+        // Nothing painted yet
+        None => path_vertical_lines(w, h),
+    }
+}
+
+/// Turns sparse painted directions (angles, NaN = not painted) into a smooth direction for every pixel.
+/// Returns None if nothing is painted.
+fn fill_direction_field(w: u64, h: u64, angles: &[f32]) -> Option<Vec<(f32, f32)>> {
+    const CELL: u64 = 16;
+    let (gw, gh) = ((w + CELL - 1) / CELL, (h + CELL - 1) / CELL);
+    let (gw, gh) = (gw as usize, gh as usize);
+
+    // Average direction of the painted pixels in every cell of a coarse grid
+    let mut sums = vec![(0.0f32, 0.0f32, 0u32); gw * gh];
+    for y in 0..h {
+        for x in 0..w {
+            let a = angles[(y * w + x) as usize];
+            if a.is_nan() {
+                continue;
+            }
+            let cell = &mut sums[(y / CELL) as usize * gw + (x / CELL) as usize];
+            cell.0 += a.cos();
+            cell.1 += a.sin();
+            cell.2 += 1;
+        }
+    }
+    let normalize = |(x, y): (f32, f32)| {
+        let len = (x * x + y * y).sqrt();
+        if len > 1e-6 { Some((x / len, y / len)) } else { None }
+    };
+    let painted: Vec<bool> = sums.iter().map(|c| c.2 > 0).collect();
+    let mut grid: Vec<Option<(f32, f32)>> =
+        sums.iter().map(|c| if c.2 > 0 { normalize((c.0, c.1)) } else { None }).collect();
+    if grid.iter().all(|c| c.is_none()) {
+        return None;
+    }
+
+    let neighbours = |i: usize| {
+        let (x, y) = (i % gw, i / gw);
+        let mut list = Vec::with_capacity(4);
+        if x > 0 { list.push(i - 1); }
+        if x + 1 < gw { list.push(i + 1); }
+        if y > 0 { list.push(i - gw); }
+        if y + 1 < gh { list.push(i + gw); }
+        list
+    };
+    // Fill the empty cells from their neighbours, ring by ring
+    loop {
+        let empty: Vec<usize> = (0..grid.len()).filter(|&i| grid[i].is_none()).collect();
+        if empty.is_empty() {
+            break;
+        }
+        let mut filled_any = false;
+        let updates: Vec<(usize, (f32, f32))> = empty
+            .iter()
+            .filter_map(|&i| {
+                let (sx, sy) = neighbours(i)
+                    .into_iter()
+                    .filter_map(|j| grid[j])
+                    .fold((0.0, 0.0), |acc, v| (acc.0 + v.0, acc.1 + v.1));
+                normalize((sx, sy)).map(|v| (i, v))
+            })
+            .collect();
+        for (i, v) in updates {
+            grid[i] = Some(v);
+            filled_any = true;
+        }
+        if !filled_any {
+            // Opposite directions cancelled out: use "down" for the rest
+            for c in grid.iter_mut().filter(|c| c.is_none()) {
+                *c = Some((0.0, 1.0));
+            }
+        }
+    }
+    // Smooth the filled-in cells, painted cells keep their direction
+    let mut grid: Vec<(f32, f32)> = grid.into_iter().map(|c| c.unwrap_or((0.0, 1.0))).collect();
+    for _ in 0..8 {
+        let previous = grid.clone();
+        for i in 0..grid.len() {
+            if painted[i] {
+                continue;
+            }
+            let (sx, sy) = neighbours(i)
+                .into_iter()
+                .chain(std::iter::once(i))
+                .map(|j| previous[j])
+                .fold((0.0, 0.0), |acc, v| (acc.0 + v.0, acc.1 + v.1));
+            if let Some(v) = normalize((sx, sy)) {
+                grid[i] = v;
+            }
+        }
+    }
+
+    // Direction of every pixel: the painted one, or interpolated between the cells
+    let field: Vec<(f32, f32)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            (0..w)
+                .map(|x| {
+                    let a = angles[(y * w + x) as usize];
+                    if !a.is_nan() {
+                        return (a.cos(), a.sin());
+                    }
+                    let gx = ((x as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, (gw - 1) as f32);
+                    let gy = ((y as f32 + 0.5) / CELL as f32 - 0.5).clamp(0.0, (gh - 1) as f32);
+                    let (x0, y0) = (gx.floor() as usize, gy.floor() as usize);
+                    let (x1, y1) = ((x0 + 1).min(gw - 1), (y0 + 1).min(gh - 1));
+                    let (tx, ty) = (gx - x0 as f32, gy - y0 as f32);
+                    let mix = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                    let top = mix(grid[y0 * gw + x0], grid[y0 * gw + x1], tx);
+                    let bottom = mix(grid[y1 * gw + x0], grid[y1 * gw + x1], tx);
+                    normalize(mix(top, bottom, ty)).unwrap_or((0.0, 1.0))
+                })
+                .collect::<Vec<(f32, f32)>>()
+        })
+        .flatten()
+        .collect();
+    Some(field)
 }

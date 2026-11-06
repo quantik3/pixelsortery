@@ -39,9 +39,12 @@ impl PixelsorterGui {
             self.values.path_x3.clone(),
             self.values.path_waves.clone(),
             self.values.path_flow.clone(),
+            PathCreator::Drawn,
             self.values.path_star.clone(),
         ];
-        let selected_text = self.values.path.to_string();
+        // Only the name, the numbers are shown on the sliders below (keeps the combo box short)
+        let short_name = |p: &PathCreator| p.to_string().split(" (").next().unwrap_or_default().to_string();
+        let selected_text = short_name(&self.values.path);
 
         ui.horizontal(|ui| {
             // Build ComboBox from entries in the path_name_mappings
@@ -49,7 +52,7 @@ impl PixelsorterGui {
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for p in available_paths {
-                        ui.selectable_value(&mut self.values.path, p, p.to_string());
+                        ui.selectable_value(&mut self.values.path, p, short_name(&p));
                     }
                 });
 
@@ -516,6 +519,7 @@ impl PixelsorterGui {
                         .unwrap_or(false);
                     ui.label(important_text("Guide"));
                     ui.horizontal(|ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         if ui
                             .add_enabled(self.layered_sorter.is_some(), Button::new("Load..."))
                             .on_hover_text("Pixels are sorted by the brightness of this image at their position")
@@ -594,6 +598,13 @@ impl PixelsorterGui {
             .map(|ls| ls.get_current_paint_mask().is_some())
             .unwrap_or(false);
         let is_threshold = selector_is_threshold(self.values.selector);
+        let has_directions = self
+            .layered_sorter
+            .as_ref()
+            .map(|ls| ls.has_current_directions())
+            .unwrap_or(false);
+        let mut clear_directions = false;
+        let previous_tool = self.brush_tool;
         // What to do with the mask after the buttons were drawn
         let mut new_mask: Option<Option<GrayImage>> = None;
         let mut save_mask = false;
@@ -602,9 +613,16 @@ impl PixelsorterGui {
 
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal(|ui| {
-                ui.label(important_text("Mask"));
-                ui.checkbox(&mut self.mask_edit, "Draw mask [B]");
+                ui.label(important_text("Brush"));
+                ui.checkbox(&mut self.mask_edit, "Draw [B]");
                 ui.checkbox(&mut self.show_mask_overlay, "Show overlay");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Paints");
+                ui.selectable_value(&mut self.brush_tool, BrushTool::Mask, "Mask")
+                    .on_hover_text("Where this layer is applied");
+                ui.selectable_value(&mut self.brush_tool, BrushTool::Direction, "Direction")
+                    .on_hover_text("Draw lines the sorting should follow (path 'Drawn'). The color shows the direction");
             });
             ui.add_enabled_ui(self.mask_edit, |ui| {
                 ui.horizontal(|ui| {
@@ -619,13 +637,26 @@ impl PixelsorterGui {
                         .suffix(" px");
                     ui.add(slider);
                 });
-                ui.horizontal(|ui| {
+                if self.brush_tool == BrushTool::Mask { ui.horizontal(|ui| {
                     ui.label("Hardness");
                     ui.spacing_mut().slider_width = 130.0;
                     ui.add(egui::Slider::new(&mut self.brush_hardness, 0.0..=1.0).fixed_decimals(2))
                         .on_hover_text("1 = hard edge. Lower values give soft edges that blend the sorted layer smoothly into the image");
-                });
+                }); }
             });
+            if self.brush_tool == BrushTool::Direction {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(has_directions, Button::new("Clear directions")).clicked() {
+                        clear_directions = true;
+                    }
+                });
+                let hint = if has_directions {
+                    "Paint strokes along the image: the sorting follows them, between strokes the directions blend. Right click erases."
+                } else {
+                    "Turn on 'Draw' and paint strokes on the image. The path switches to 'Drawn' automatically."
+                };
+                ui.label(RichText::new(hint).small());
+            } else {
             ui.horizontal(|ui| {
                 if let Some(ls) = &self.layered_sorter {
                     if ui.button("Fill").on_hover_text("Sort the whole image (mask everything)").clicked() {
@@ -670,7 +701,21 @@ impl PixelsorterGui {
                 "No mask: the whole image is sorted."
             };
             ui.label(RichText::new(hint).small());
+            }
         });
+
+        if self.brush_tool != previous_tool {
+            self.mask_texture_dirty = true;
+        }
+        if clear_directions {
+            if let Some(ls) = &mut self.layered_sorter {
+                ls.clear_current_directions();
+                self.mask_texture_dirty = true;
+                if self.auto_sort {
+                    self.do_sort = true;
+                }
+            }
+        }
 
         if save_mask {
             self.save_paint_mask();
@@ -883,6 +928,8 @@ impl PixelsorterGui {
                     flex.add_ui(item(), |ui|{
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                            // Long layer names are cut off with "…" instead of widening the side panel
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
 
                             let res_del = ui.add_enabled_ui(!only_one_layer, |ui|{
                                 ui.add_sized(vec2(20.0, 30.0), delete_button)

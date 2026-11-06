@@ -31,7 +31,7 @@ mod blend;
 mod brush;
 mod layers;
 use blend::BlendMode;
-use brush::paint_mask_stroke;
+use brush::{paint_direction_stroke, paint_mask_stroke};
 
 /// How long the "Saved" Label should be visible before it vanishes
 const SAVED_LABEL_VANISH_TIMEOUT: f32 = 2.0;
@@ -109,6 +109,10 @@ struct PixelsorterGui {
     brush_erase: bool,
     /// 1 = hard brush edge, smaller = softer edge
     brush_hardness: f32,
+    /// What the brush paints
+    brush_tool: BrushTool,
+    /// The tool the overlay texture was built for
+    overlay_tool: BrushTool,
     /// Texture of the mask overlay
     mask_texture: Option<TextureHandle>,
     /// The mask texture has to be rebuilt (layer changed, mask replaced, ...)
@@ -175,6 +179,22 @@ struct PixelsorterValues {
     blend: BlendMode,
     /// Opacity of the layer (0 - 1)
     opacity: f32,
+}
+
+/// What the overlay on the image shows
+#[derive(Clone, Copy)]
+enum OverlaySource<'a> {
+    Mask(&'a GrayImage),
+    Directions(&'a [f32]),
+}
+
+/// What the brush paints
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrushTool {
+    /// Where the layer is applied
+    Mask,
+    /// Directions for the path "Drawn"
+    Direction,
 }
 
 /// A sort running in a background thread
@@ -300,6 +320,8 @@ impl Default for PixelsorterGui {
             brush_radius: 30.0,
             brush_erase: false,
             brush_hardness: 1.0,
+            brush_tool: BrushTool::Mask,
+            overlay_tool: BrushTool::Mask,
             mask_texture: None,
             mask_texture_dirty: true,
             mask_stroke_active: false,
@@ -567,37 +589,78 @@ impl PixelsorterGui {
             if let Some(pos) = pointer_pos {
                 // The right mouse button does the opposite of the selected tool
                 let erase = self.brush_erase != secondary_down;
-                let had_mask = ls.get_current_paint_mask().is_some();
                 let current = to_img(pos);
-                let from = self.last_brush_pos.unwrap_or(current);
-                let mask = ls.get_current_paint_mask_mut();
-                changed_region = paint_mask_stroke(mask, from, current, self.brush_radius, erase, self.brush_hardness);
-                if !had_mask {
-                    // The mask was just created, the overlay has to be built from scratch
-                    self.mask_texture_dirty = true;
+                match self.brush_tool {
+                    BrushTool::Mask => {
+                        let had_mask = ls.get_current_paint_mask().is_some();
+                        let from = self.last_brush_pos.unwrap_or(current);
+                        let mask = ls.get_current_paint_mask_mut();
+                        changed_region =
+                            paint_mask_stroke(mask, from, current, self.brush_radius, erase, self.brush_hardness);
+                        if !had_mask {
+                            // The mask was just created, the overlay has to be built from scratch
+                            self.mask_texture_dirty = true;
+                        }
+                        self.last_brush_pos = Some(current);
+                        self.mask_stroke_changed = true;
+                    }
+                    BrushTool::Direction => {
+                        match self.last_brush_pos {
+                            // The direction is only known after the mouse moved
+                            None => self.last_brush_pos = Some(current),
+                            Some(from) => {
+                                let had_directions = ls.has_current_directions();
+                                let directions = ls.get_current_directions_mut();
+                                changed_region =
+                                    paint_direction_stroke(directions, w, h, from, current, self.brush_radius, erase);
+                                if changed_region.is_some() {
+                                    self.last_brush_pos = Some(current);
+                                    self.mask_stroke_changed = true;
+                                }
+                                if !had_directions {
+                                    self.mask_texture_dirty = true;
+                                }
+                                // Painting directions only makes sense with the path that uses them
+                                if self.values.path != PathCreator::Drawn {
+                                    self.values.path = PathCreator::Drawn;
+                                    ls.update_current(self.values);
+                                }
+                            }
+                        }
+                    }
                 }
-                self.last_brush_pos = Some(current);
-                self.mask_stroke_changed = true;
             }
         } else {
             self.last_brush_pos = None;
         }
 
-        // Keep the overlay texture up to date
-        let mask = self.layered_sorter.as_ref().and_then(|ls| ls.get_current_paint_mask());
-        match mask {
+        // Keep the overlay texture up to date (it shows the mask or the directions, depending on the tool)
+        if self.overlay_tool != self.brush_tool {
+            self.overlay_tool = self.brush_tool;
+            self.mask_texture_dirty = true;
+        }
+        let ls = self.layered_sorter.as_ref().unwrap();
+        let overlay = match self.brush_tool {
+            BrushTool::Mask => ls.get_current_paint_mask().map(OverlaySource::Mask),
+            BrushTool::Direction => ls.get_current_directions().map(OverlaySource::Directions),
+        };
+        match overlay {
             None => self.mask_texture = None,
-            Some(mask) => {
+            Some(source) => {
+                let overlay = |region: [u32; 4]| match source {
+                    OverlaySource::Mask(mask) => mask_overlay_image(mask, region),
+                    OverlaySource::Directions(dirs) => direction_overlay_image(dirs, w, region),
+                };
                 let size_matches = self
                     .mask_texture
                     .as_ref()
-                    .map(|t| t.size() == [mask.width() as usize, mask.height() as usize])
+                    .map(|t| t.size() == [w as usize, h as usize])
                     .unwrap_or(false);
                 if self.mask_texture_dirty || !size_matches {
-                    let full = mask_overlay_image(mask, [0, 0, mask.width(), mask.height()]);
+                    let full = overlay([0, 0, w, h]);
                     self.mask_texture = Some(ui.ctx().load_texture("mask-overlay", full, mask_texture_options()));
                 } else if let (Some(region), Some(tex)) = (changed_region, &mut self.mask_texture) {
-                    let part = mask_overlay_image(mask, region);
+                    let part = overlay(region);
                     tex.set_partial([region[0] as usize, region[1] as usize], part, mask_texture_options());
                 }
                 self.mask_texture_dirty = false;
@@ -1022,7 +1085,9 @@ impl eframe::App for PixelsorterGui {
                 ui.add_space(5.0);
                 // Limit the width: content that is too wide must not push the image to the right
                 let panel_width = ui.available_width();
-                ScrollArea::vertical()
+                // Scrolling in both directions: only then egui limits the width of the scroll area
+                // (a vertical-only scroll area always grows with its content)
+                ScrollArea::both()
                     .max_height(f32::INFINITY)
                     .max_width(panel_width)
                     .show(ui, |ui| {
@@ -1346,3 +1411,23 @@ fn mask_overlay_image(mask: &GrayImage, region: [u32; 4]) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([(x1 - x0) as usize, (y1 - y0) as usize], &rgba)
 }
 
+/// Creates the overlay image for a region `[x0, y0, x1, y1]` (end exclusive) of the painted directions.
+/// The color shows the direction (like a color wheel), unpainted pixels are transparent.
+fn direction_overlay_image(directions: &[f32], w: u32, region: [u32; 4]) -> ColorImage {
+    let [x0, y0, x1, y1] = region;
+    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+    for y in y0..y1 {
+        let row = (y * w) as usize;
+        for x in x0..x1 {
+            let angle = directions[row + x as usize];
+            if angle.is_nan() {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let hue = (angle / std::f32::consts::TAU).rem_euclid(1.0);
+                let color: Color32 = egui::epaint::Hsva::new(hue, 0.85, 1.0, 1.0).into();
+                rgba.extend_from_slice(&[color.r(), color.g(), color.b(), 120]);
+            }
+        }
+    }
+    ColorImage::from_rgba_unmultiplied([(x1 - x0) as usize, (y1 - y0) as usize], &rgba)
+}
