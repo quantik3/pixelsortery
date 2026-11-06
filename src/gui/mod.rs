@@ -14,7 +14,7 @@ use log::{info, warn};
 use pixelsortery::{
     path_creator::{PathCreator, DEFAULT_CENTER},
     pixel_selector::{
-        PixelSelectCriteria,
+        CombineOp, Condition, PixelSelectCriteria,
         PixelSelector::{self, *},
     },
     span_sorter::{SortingAlgorithm, SortingCriteria},
@@ -26,7 +26,7 @@ use std::{
     ffi::OsString, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, mpsc::Receiver, Arc, Mutex}, thread::JoinHandle, time::{Duration, Instant}
 };
 
-use crate::{AUTHORS, PACKAGE_NAME, VERSION};
+use crate::{APP_NAME, AUTHORS, PACKAGE_NAME, VERSION};
 mod blend;
 mod presets;
 mod brush;
@@ -69,7 +69,7 @@ pub fn init(ps: Option<&Pixelsorter>, img: Option<(RgbImage, PathBuf)>, video: O
         psgui.do_open_video = true;
     }
     eframe::run_native(
-        "Pixelsortery",
+        APP_NAME,
         options,
         Box::new(|cc| {
              // This gives us image support
@@ -213,6 +213,7 @@ struct PixelsorterValues {
     selector_fixed: PixelSelector,
     selector_thres: PixelSelector,
     selector_edges: PixelSelector,
+    selector_combined: PixelSelector,
     /// Center for rays, circles and spirals (relative to the image size)
     path_center: (f32, f32),
     /// Reverse every second span (herringbone)
@@ -327,6 +328,7 @@ impl PixelsorterValues {
                 self.selector_thres = Threshold { min, max, criteria }
             }
             Edges { threshold } => self.selector_edges = Edges { threshold },
+            Combined { .. } => self.selector_combined = self.selector,
             Full => warn!("The gui doesn't support the Full-Selector. Just because."),
         }
     }
@@ -362,6 +364,12 @@ impl Default for PixelsorterGui {
                 blend: BlendMode::Normal,
                 opacity: 1.0,
                 selector_edges: PixelSelector::Edges { threshold: 80 },
+                // "Bright and red"
+                selector_combined: PixelSelector::Combined {
+                    first: Condition { criteria: PixelSelectCriteria::Hue, min: 0, max: 30 },
+                    second: Condition { criteria: PixelSelectCriteria::Brightness, min: 100, max: 255 },
+                    op: CombineOp::And,
+                },
                 path_center: DEFAULT_CENTER,
                 alternate: false,
                 passes: 8,
@@ -1504,13 +1512,16 @@ impl eframe::App for PixelsorterGui {
                 ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
                     ui.horizontal(|ui|{
                         ui.spacing_mut().item_spacing.x = 0.0;
+                        // Right to left, shows: "Pixlflow v1.0.0 by Lxtharia, quantik3 · based on Pixelsortery"
+                        ui.hyperlink_to(to_title_case(PACKAGE_NAME), "https://github.com/Lxtharia/pixelsortery");
+                        ui.label(" · based on ");
                         ui.label(format!(
                             " v{} by {}",
                             VERSION,
-                            AUTHORS
+                            // Cargo joins the authors with ':'
+                            AUTHORS.replace(':', ", ")
                         ));
-                        ui.label(" ");
-                        ui.hyperlink_to(to_title_case(PACKAGE_NAME), "https://github.com/Lxtharia/pixelsortery");
+                        ui.hyperlink_to(APP_NAME, "https://github.com/quantik3/pixelsortery");
                     });
                     ui.separator();
                     if let Some(tex) = &self.texture {
@@ -1763,15 +1774,9 @@ fn full_width(ui: &Ui) -> f32 {
 fn full_height(ui: &Ui) -> f32 {
     ui.max_rect().max.y - ui.max_rect().min.y
 }
+/// Does the selector pick pixels by their values (threshold or combined), so a mask can be shown?
 fn selector_is_threshold(sel: PixelSelector) -> bool {
-    matches!(
-        sel,
-        Threshold {
-            min: _,
-            max: _,
-            criteria: _
-        }
-    )
+    sel.uses_thresholds()
 }
 
 /// opens a file dialog to let the user choose a destination for a file

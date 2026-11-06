@@ -2,7 +2,7 @@
 
 use crate::{
     path_creator::{PathCreator, DEFAULT_CENTER},
-    pixel_selector::{PixelSelectCriteria, PixelSelector},
+    pixel_selector::{CombineOp, Condition, PixelSelectCriteria, PixelSelector},
     span_sorter::{SortingAlgorithm, SortingCriteria},
     ChannelMode, Pixelsorter,
 };
@@ -30,6 +30,7 @@ const ALL_ALGORITHMS: [SortingAlgorithm; 7] = [
     SortingAlgorithm::DebugColor,
 ];
 const ALL_CHANNELS: [ChannelMode; 4] = [ChannelMode::All, ChannelMode::Red, ChannelMode::Green, ChannelMode::Blue];
+const ALL_COMBINE_OPS: [CombineOp; 2] = [CombineOp::And, CombineOp::Or];
 const ALL_SELECT_CRITERIA: [PixelSelectCriteria; 3] =
     [PixelSelectCriteria::Hue, PixelSelectCriteria::Brightness, PixelSelectCriteria::Saturation];
 
@@ -107,7 +108,20 @@ fn selector_to_string(s: PixelSelector) -> String {
         PixelSelector::Random { max } => format!("random:{}", max),
         PixelSelector::Threshold { min, max, criteria } => format!("thres:{:?}:{}:{}", criteria, min, max),
         PixelSelector::Edges { threshold } => format!("edges:{}", threshold),
+        PixelSelector::Combined { first, second, op } => format!(
+            "comb:{:?}:{:?}:{}:{}:{:?}:{}:{}",
+            op, first.criteria, first.min, first.max, second.criteria, second.min, second.max
+        ),
     }
+}
+
+/// Reads "criteria:min:max" starting at `parts[i]`
+fn condition_from_parts(parts: &[&str], i: usize) -> Result<Condition, String> {
+    Ok(Condition {
+        criteria: parse_name(&ALL_SELECT_CRITERIA, parts.get(i).copied().unwrap_or_default())?,
+        min: parse_num(parts.get(i + 1).copied(), "condition min")?,
+        max: parse_num(parts.get(i + 2).copied(), "condition max")?,
+    })
 }
 
 fn selector_from_string(s: &str) -> Result<PixelSelector, String> {
@@ -121,6 +135,11 @@ fn selector_from_string(s: &str) -> Result<PixelSelector, String> {
             criteria: parse_name(&ALL_SELECT_CRITERIA, parts.get(1).copied().unwrap_or_default())?,
             min: parse_num(parts.get(2).copied(), "threshold min")?,
             max: parse_num(parts.get(3).copied(), "threshold max")?,
+        },
+        "comb" => PixelSelector::Combined {
+            op: parse_name(&ALL_COMBINE_OPS, parts.get(1).copied().unwrap_or_default())?,
+            first: condition_from_parts(&parts, 2)?,
+            second: condition_from_parts(&parts, 5)?,
         },
         other => return Err(format!("Unknown selector '{}'", other)),
     })
@@ -204,7 +223,17 @@ impl Pixelsorter {
         };
 
         let low = rng.gen_range(0..180u64);
-        self.selector = match rng.gen_range(0..4u32) {
+        let condition = |rng: &mut rand::rngs::ThreadRng| {
+            let criteria = ALL_SELECT_CRITERIA[rng.gen_range(0..ALL_SELECT_CRITERIA.len())];
+            let min = rng.gen_range(0..180u64);
+            Condition { criteria, min, max: min + rng.gen_range(40..200u64) }
+        };
+        self.selector = match rng.gen_range(0..5u32) {
+            4 => PixelSelector::Combined {
+                first: condition(&mut rng),
+                second: condition(&mut rng),
+                op: if rng.gen_bool(0.5) { CombineOp::And } else { CombineOp::Or },
+            },
             0 => PixelSelector::Fixed { len: rng.gen_range(10..800u64) },
             1 => PixelSelector::Random { max: rng.gen_range(10..800u32) },
             2 => PixelSelector::Edges { threshold: rng.gen_range(20..250u64) },

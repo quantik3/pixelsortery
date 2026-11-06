@@ -29,6 +29,44 @@ pub enum PixelSelector {
     Edges {
         threshold: u64,
     },
+    /// Two threshold conditions combined, e.g. "bright AND red"
+    Combined {
+        first: Condition,
+        second: Condition,
+        op: CombineOp,
+    },
+}
+
+/// One condition of a combined selector: the value of `criteria` is between `min` and `max`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Condition {
+    pub criteria: PixelSelectCriteria,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl Condition {
+    pub fn matches(&self, p: &Rgb<u8>) -> bool {
+        let value = criteria_value(self.criteria, p) as u64;
+        value >= self.min && value <= self.max
+    }
+}
+
+/// How the two conditions of a combined selector are joined
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombineOp {
+    /// Both conditions have to be true
+    And,
+    /// One of the conditions is enough
+    Or,
+}
+
+fn criteria_value(criteria: PixelSelectCriteria, p: &Rgb<u8>) -> u16 {
+    match criteria {
+        PixelSelectCriteria::Hue => get_hue(p),
+        PixelSelectCriteria::Brightness => get_brightness(p),
+        PixelSelectCriteria::Saturation => get_saturation(p),
+    }
 }
 
 /// Key criteria which a (Threshold-)Selector should use as a key
@@ -50,13 +88,13 @@ impl PixelSelector {
             PixelSelector::Fixed { len } => fixed_selector(pixels, len),
             PixelSelector::Random { max } => random_selector(pixels, max),
             PixelSelector::Threshold { min, max, criteria } => threshold_selector(pixels, criteria, min, max),
-            PixelSelector::Edges { .. } => {
+            PixelSelector::Edges { .. } | PixelSelector::Combined { .. } => {
                 // Find the spans on a copy, then split the pixels accordingly
                 let copy: Vec<Rgb<u8>> = pixels.iter().map(|p| **p).collect();
                 let mut spans = Vec::new();
                 let mut taken = 0;
                 for (start, end) in self.span_ranges(&copy) {
-                    // Skip the pixels between spans (there are none for this selector)
+                    // Skip the pixels between spans
                     pixels.drain(0..start - taken);
                     spans.push(pixels.drain(0..end - start).collect());
                     taken = end;
@@ -137,6 +175,23 @@ impl PixelSelector {
                     ranges.push((s, n));
                 }
             }
+            PixelSelector::Combined { .. } => {
+                let mut span_start: Option<usize> = None;
+                for (i, p) in pixels.iter().enumerate() {
+                    let valid = self.is_selected(p).unwrap_or(true);
+                    match (valid, span_start) {
+                        (true, None) => span_start = Some(i),
+                        (false, Some(s)) => {
+                            ranges.push((s, i));
+                            span_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = span_start {
+                    ranges.push((s, n));
+                }
+            }
             PixelSelector::Edges { threshold } => {
                 if n == 0 {
                     return ranges;
@@ -164,26 +219,42 @@ impl PixelSelector {
                 min, criteria, max
             ),
             PixelSelector::Edges { threshold } => format!("Spans ending at edges (color difference > {})", threshold),
+            PixelSelector::Combined { first, second, op } => format!(
+                "Selecting Pixels with: [{} < {:?} < {}] {:?} [{} < {:?} < {}]",
+                first.min, first.criteria, first.max, op, second.min, second.criteria, second.max
+            ),
         }
     }
-    pub fn mask(self, pixels: &mut Vec<&mut Rgb<u8>>) -> Result<(), ()> {
-        if let PixelSelector::Threshold { min, max, criteria } = self {
-            let value_function = match criteria {
-                PixelSelectCriteria::Hue => get_hue,
-                PixelSelectCriteria::Brightness => get_brightness,
-                PixelSelectCriteria::Saturation => get_saturation,
-            };
-            let valid = |val| (val as u64) >= min && (val as u64) <= max;
-            pixels.iter_mut().for_each(|p| {
-                if valid(value_function(p)) {
-                    **p = Rgb { 0: [255, 255, 255] };
-                } else {
-                    **p = Rgb { 0: [0, 0, 0] };
-                }
-            });
-            return Ok(());
+
+    /// Does this selector select pixels by their values (threshold or combined), so a mask can be shown?
+    pub fn uses_thresholds(self) -> bool {
+        matches!(self, PixelSelector::Threshold { .. } | PixelSelector::Combined { .. })
+    }
+
+    /// Is the pixel selected? None for selectors that don't decide per pixel (fixed, random, ...)
+    pub fn is_selected(self, p: &Rgb<u8>) -> Option<bool> {
+        match self {
+            PixelSelector::Threshold { min, max, criteria } => Some(Condition { criteria, min, max }.matches(p)),
+            PixelSelector::Combined { first, second, op } => Some(match op {
+                CombineOp::And => first.matches(p) && second.matches(p),
+                CombineOp::Or => first.matches(p) || second.matches(p),
+            }),
+            _ => None,
         }
-        Err(())
+    }
+
+    pub fn mask(self, pixels: &mut Vec<&mut Rgb<u8>>) -> Result<(), ()> {
+        if !self.uses_thresholds() {
+            return Err(());
+        }
+        pixels.iter_mut().for_each(|p| {
+            if self.is_selected(p).unwrap_or(false) {
+                **p = Rgb { 0: [255, 255, 255] };
+            } else {
+                **p = Rgb { 0: [0, 0, 0] };
+            }
+        });
+        Ok(())
     }
 }
 

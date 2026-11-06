@@ -2,7 +2,10 @@ use image::{
     imageops::{self, FilterType},
     GrayImage, Luma, RgbImage,
 };
-use pixelsortery::{path_creator::PathCreator, pixel_selector::PixelSelector};
+use pixelsortery::{
+    path_creator::PathCreator,
+    pixel_selector::{CombineOp, Condition, PixelSelector},
+};
 use std::sync::Arc;
 use pixelsortery::Pixelsorter;
 
@@ -657,6 +660,18 @@ impl PixelsorterValues {
                 max: int(max1 as f64, max2 as f64) as u64,
                 criteria: c1,
             },
+            (
+                PixelSelector::Combined { first: f1, second: s1, .. },
+                PixelSelector::Combined { first: f2, second: s2, .. },
+            ) if f1.criteria == f2.criteria && s1.criteria == s2.criteria => {
+                let op = if let PixelSelector::Combined { op, .. } = v.selector { op } else { CombineOp::And };
+                let mix = |a: Condition, b: Condition| Condition {
+                    criteria: a.criteria,
+                    min: int(a.min as f64, b.min as f64) as u64,
+                    max: int(a.max as f64, b.max as f64) as u64,
+                };
+                PixelSelector::Combined { first: mix(f1, f2), second: mix(s1, s2), op }
+            }
             _ => v.selector,
         };
         v.path_center = (f(self.path_center.0, end.path_center.0), f(self.path_center.1, end.path_center.1));

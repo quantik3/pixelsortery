@@ -29,22 +29,22 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin_name: pixelsortery-linux
+            bin_name: pixlflow-linux
             cargo_target: release
             package_manager_cmd: sudo apt-get update && sudo apt-get install -y ffmpeg libsdl2-dev
           - os: macos-14
             target: x86_64-apple-darwin
-            bin_name: pixelsortery-darwin-x86
+            bin_name: pixlflow-darwin-x86
             cargo_target: release
             package_manager_cmd: brew update && brew install ffmpeg sdl2
           - os: macos-14
             target: aarch64-apple-darwin
-            bin_name: pixelsortery-darwin-aarch
+            bin_name: pixlflow-darwin-aarch
             cargo_target: release
             package_manager_cmd: brew update && brew install ffmpeg sdl2
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin_name: pixelsortery-windows
+            bin_name: pixlflow-windows
             cargo_target: release
             package_manager_cmd: choco install ffmpeg-full
     runs-on: ${{ matrix.os }}
@@ -89,7 +89,7 @@ jobs:
       shell: bash
       run: |
         if [[ "$RUNNER_OS" == "Windows" ]] ; then EXT=".exe"; fi
-        src=target/${{ matrix.target }}/${{ matrix.cargo_target }}/pixelsortery$EXT
+        src=target/${{ matrix.target }}/${{ matrix.cargo_target }}/pixlflow$EXT
         dst=${{ matrix.bin_name }}-${{ env.TAG_NAME }}$EXT
         ls -lah target/*
         mv  "$src" "$dst"
@@ -108,7 +108,7 @@ jobs:
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      ARTIFACTS: pixelsortery-linux  pixelsortery-darwin-x86 pixelsortery-darwin-aarch pixelsortery-windows
+      ARTIFACTS: pixlflow-linux  pixlflow-darwin-x86 pixlflow-darwin-aarch pixlflow-windows
     permissions:
       contents: write
     steps:

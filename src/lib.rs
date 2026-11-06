@@ -97,6 +97,10 @@ impl Pixelsorter {
             PixelSelector::Fixed { len } => format!("Fixed length ({})", len),
             PixelSelector::Random { max } => format!("Random length ({})", max),
             PixelSelector::Edges { threshold } => format!("Edges ({})", threshold),
+            PixelSelector::Combined { first, second, op } => format!(
+                "{:?}({}-{}) {:?} {:?}({}-{})",
+                first.criteria, first.min, first.max, op, second.criteria, second.min, second.max
+            ),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{}{}-{}",
                 match criteria {
@@ -161,6 +165,10 @@ impl Pixelsorter {
             PixelSelector::Fixed { len } => format!("Fixed ({})", len),
             PixelSelector::Random { max } => format!("Random ({})", max),
             PixelSelector::Edges { threshold } => format!("Edges ({})", threshold),
+            PixelSelector::Combined { first, second, op } => format!(
+                "{:?}({}-{}) {:?} {:?}({}-{})",
+                first.criteria, first.min, first.max, op, second.criteria, second.min, second.max
+            ),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{} ({}-{})",
                 match criteria {
@@ -225,6 +233,11 @@ impl Pixelsorter {
             PixelSelector::Fixed { len } => format!("fixed{}", len),
             PixelSelector::Random { max } => format!("rand{}", max),
             PixelSelector::Edges { threshold } => format!("edges{}", threshold),
+            PixelSelector::Combined { first, second, op } => format!(
+                "{:?}{}-{}{:?}{:?}{}-{}",
+                first.criteria, first.min, first.max, op, second.criteria, second.min, second.max
+            )
+            .to_lowercase(),
             PixelSelector::Threshold { min, max, criteria } => format!(
                 "{}{}-{}",
                 match criteria {
@@ -408,11 +421,7 @@ impl Pixelsorter {
 
     pub fn mask(&self, img: &mut RgbImage) -> bool {
         let mut all_pixels: Vec<&mut Rgb<u8>> = img.pixels_mut().collect();
-        if let PixelSelector::Threshold { min, max, criteria } = self.selector {
-            self.selector.mask(&mut all_pixels);
-            return true;
-        }
-        return false;
+        self.selector.mask(&mut all_pixels).is_ok()
     }
 }
 

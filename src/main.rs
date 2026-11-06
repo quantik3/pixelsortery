@@ -16,6 +16,8 @@ mod gui;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+/// The name of the program shown to users
+const APP_NAME: &str = "Pixlflow";
 
 
 fn parse_parameter<T: FromStr>(arg: Option<String>, usage: &str) -> T {
@@ -61,7 +63,7 @@ fn parse_thres_selector_parameters(arg: Option<String>) -> PixelSelector {
 
 const HELP_STRING: &str = "
 =================== Pixelsorter ===================
-   USAGE: pixelsortery <input> <output> [<options>]
+   USAGE: pixlflow <input> <output> [<options>]
 
    -i | --input  <FILE> : Set input file explicitly
    -o | --output <FILE> : Set output file explicitly
@@ -116,6 +118,8 @@ const HELP_STRING: &str = "
    --fixed  <max>                        : Sort spans of a fixed length <max>
    --thres <hue|bright|sat>:<min>:<max>  : Mark pixels as valid if [hue|bright|sat] is between <min> and <max>
    --edges <threshold>                   : End spans at edges, where neighbouring colors differ more than <threshold> (0-765)
+   --combine <and|or> <hue|bright|sat>:<min>:<max> <hue|bright|sat>:<min>:<max>
+                                         : Combine two thresholds, e.g. bright AND red: --combine and hue:0:30 bright:100:255
 
 ============ Sorting Algorithm Options ==========
 
@@ -185,7 +189,7 @@ fn main() {
     while let Some(arg) = args.pop_front() {
         match arg.as_str() {
             "-h" | "--help"    => { println!("{}", HELP_STRING); exit(0); }
-            "-V" | "--version" => { println!("{} {}", PACKAGE_NAME, VERSION); exit(0); }
+            "-V" | "--version" => { println!("{} {}", APP_NAME, VERSION); exit(0); }
             "-i" | "--input"  => {
                     if ! input_path.is_empty() {warn!("--input flag taking precedence over positional argument")}
                     input_path = parse_parameter::<String>(args.pop_front(), "--input <FILE>")
@@ -279,6 +283,23 @@ fn main() {
                 }
             }
             "--posterize" => ps.posterize = parse_parameter(args.pop_front(), "--posterize <levels>"),
+            "--combine"    => {
+                let op = match args.pop_front().unwrap_or_default().to_lowercase().as_str() {
+                    "and" => pixelsortery::pixel_selector::CombineOp::And,
+                    "or" => pixelsortery::pixel_selector::CombineOp::Or,
+                    _ => {
+                        eprintln!("[ERROR] Wrong syntax, usage: --combine <and|or> hue:0:30 bright:100:255");
+                        exit(-1)
+                    }
+                };
+                let mut condition = || match parse_thres_selector_parameters(args.pop_front()) {
+                    PixelSelector::Threshold { min, max, criteria } => pixelsortery::pixel_selector::Condition { criteria, min, max },
+                    _ => unreachable!(),
+                };
+                let first = condition();
+                let second = condition();
+                ps.selector = PixelSelector::Combined { first, second, op };
+            }
             "--edges"      => ps.selector = PixelSelector::Edges { threshold: parse_parameter(args.pop_front(), "--edges <threshold>") },
             "--partial"    => {
                 ps.sorter.algorithm = SortingAlgorithm::Partial;

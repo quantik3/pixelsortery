@@ -16,6 +16,38 @@ use pixelsortery::{
 
 use super::*;
 
+/// Rows of a grid for one condition of the combined selector: criteria, min and max
+fn condition_ui(ui: &mut Ui, label: &str, condition: &mut Condition) {
+    ui.label(important_text(label));
+    ui.horizontal(|ui| {
+        for (criteria, name) in [
+            (PixelSelectCriteria::Hue, "Hue"),
+            (PixelSelectCriteria::Brightness, "Bright"),
+            (PixelSelectCriteria::Saturation, "Sat"),
+        ] {
+            ui.selectable_value(&mut condition.criteria, criteria, name);
+        }
+    });
+    ui.end_row();
+    let (cap, suffix) = if condition.criteria == PixelSelectCriteria::Hue { (360, "°") } else { (256, "") };
+    ui.label("Min");
+    if ui
+        .add(egui::Slider::new(&mut condition.min, 0..=cap).suffix(suffix).smart_aim(false))
+        .dragged()
+    {
+        condition.max = condition.max.max(condition.min);
+    }
+    ui.end_row();
+    ui.label("Max");
+    if ui
+        .add(egui::Slider::new(&mut condition.max, 0..=cap).suffix(suffix).smart_aim(false))
+        .dragged()
+    {
+        condition.min = condition.min.min(condition.max);
+    }
+    ui.end_row();
+}
+
 // A style i want to apply to multiple labels
 fn important_text(s: &str) -> RichText {
     //RichText::new(s).underline()
@@ -263,12 +295,14 @@ impl PixelsorterGui {
 
     pub(super) fn selector_combo_box(&mut self, ui: &mut Ui, id: u64) {
         ui.visuals_mut().weak_text_color();
-        ui.horizontal(|ui| {
+        // Wraps into two rows if needed, so it never widens the side panel
+        ui.horizontal_wrapped(|ui| {
             for (s, n) in vec![
                 (self.values.selector_fixed, "Fixed"),
                 (self.values.selector_random, "Random"),
                 (self.values.selector_thres, "Threshold"),
                 (self.values.selector_edges, "Edges"),
+                (self.values.selector_combined, "Combined"),
             ] {
                 ui.selectable_value(&mut self.values.selector, s, n);
             }
@@ -401,6 +435,21 @@ impl PixelsorterGui {
                         ui.end_row();
                         // Save selector state
                         self.values.selector_edges = self.values.selector;
+                    }
+                    PixelSelector::Combined { first, second, op } => {
+                        ui.spacing_mut().slider_width = 120.0;
+                        condition_ui(ui, "First", first);
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(op, CombineOp::And, "AND")
+                                .on_hover_text("Pixels have to match both conditions");
+                            ui.selectable_value(op, CombineOp::Or, "OR")
+                                .on_hover_text("Pixels have to match at least one condition");
+                        });
+                        ui.end_row();
+                        condition_ui(ui, "Second", second);
+                        // Save selector state
+                        self.values.selector_combined = self.values.selector;
                     }
                     // We don't expose the Full Selector to the gui, so I don't wanna support it
                     PixelSelector::Full => {

@@ -1,5 +1,5 @@
 # Builds the Windows version: on every push to main, or manually (Actions -> Build Windows -> Run workflow).
-# Result: a zip in the Artifacts of the run with pixelsortery.exe + the FFmpeg DLLs (keep them in one folder).
+# Result: a zip in the Artifacts of the run with pixlflow.exe + the FFmpeg DLLs (keep them in one folder).
 name: Build Windows
 
 on:
@@ -71,7 +71,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\pixelsortery.exe dist\
+          Copy-Item target\release\pixlflow.exe dist\
           if ($env:VIDEO -eq 'true') {
             Copy-Item "$env:FFMPEG_DIR\bin\*.dll" dist\
             Copy-Item "$env:FFMPEG_DIR\bin\ffplay.exe" dist\ -ErrorAction SilentlyContinue
@@ -80,6 +80,6 @@ jobs:
 
       - uses: actions/upload-artifact@v6
         with:
-          name: pixelsortery-windows${{ env.VIDEO == 'true' && '-video' || '' }}-${{ github.sha }}
+          name: pixlflow-windows${{ env.VIDEO == 'true' && '-video' || '' }}-${{ github.sha }}
           path: dist/
           retention-days: 30

@@ -1,8 +1,14 @@
 [package]
+# The package (and the library in the code) keeps the original name, the program is called Pixlflow
 name = "pixelsortery"
-authors = ["Lxtharia"]
-version = "0.10.0"
+authors = ["Lxtharia", "quantik3"]
+version = "1.0.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "pixlflow"
+path = "src/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
