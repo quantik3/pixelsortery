@@ -7,7 +7,7 @@ use eframe::{
 };
 use egui::{Align2, Frame, Label, SliderClamping, Stroke, TextBuffer};
 use egui_flex::FlexInstance;
-use log::info;
+use log::{info, warn};
 use pixelsortery::{
     path_creator::PathCreator,
     pixel_selector::{PixelSelectCriteria, PixelSelector},
@@ -71,6 +71,8 @@ impl PixelsorterGui {
                     .num_columns(2)
                     .min_row_height(25.0)
                     .show(ui, |ui| {
+                        // Narrower sliders, so the longer labels still fit into the side panel
+                        ui.spacing_mut().slider_width = 120.0;
                         ui.label(important_text("Angle"));
                         let slider = egui::Slider::new(angle, 0.0..=360.0)
                             .suffix("°")
@@ -91,6 +93,8 @@ impl PixelsorterGui {
                     .num_columns(2)
                     .min_row_height(25.0)
                     .show(ui, |ui| {
+                        // Narrower sliders, so the longer labels still fit into the side panel
+                        ui.spacing_mut().slider_width = 120.0;
                         let slider_a = egui::Slider::new(offset_y, -h2..=h2)
                             .clamping(SliderClamping::Never)
                             .drag_value_speed(0.2)
@@ -123,6 +127,8 @@ impl PixelsorterGui {
                     .num_columns(2)
                     .min_row_height(25.0)
                     .show(ui, |ui| {
+                        // Narrower sliders, so the longer labels still fit into the side panel
+                        ui.spacing_mut().slider_width = 120.0;
                         ui.label(important_text("Amplitude"));
                         ui.add(
                             egui::Slider::new(amplitude, 0.0..=500.0)
@@ -158,6 +164,8 @@ impl PixelsorterGui {
                     .num_columns(2)
                     .min_row_height(25.0)
                     .show(ui, |ui| {
+                        // Narrower sliders, so the longer labels still fit into the side panel
+                        ui.spacing_mut().slider_width = 120.0;
                         ui.label(important_text("Swirl size"));
                         ui.add(
                             egui::Slider::new(scale, 5.0..=3000.0)
@@ -185,6 +193,8 @@ impl PixelsorterGui {
                     .num_columns(2)
                     .min_row_height(25.0)
                     .show(ui, |ui| {
+                        // Narrower sliders, so the longer labels still fit into the side panel
+                        ui.spacing_mut().slider_width = 120.0;
                         ui.label(important_text("Points"));
                         ui.add(egui::Slider::new(points, 2..=24));
                         ui.end_row();
@@ -221,6 +231,8 @@ impl PixelsorterGui {
                 .num_columns(2)
                 .min_row_height(25.0)
                 .show(ui, |ui| {
+                    // Narrower sliders, so the longer labels still fit into the side panel
+                    ui.spacing_mut().slider_width = 120.0;
                     ui.label(important_text("Center X"));
                     ui.add(egui::Slider::new(&mut self.values.path_center.0, 0.0..=1.0).fixed_decimals(2));
                     ui.end_row();
@@ -548,6 +560,28 @@ impl PixelsorterGui {
                 ui.checkbox(&mut self.values.alternate, "Alternate direction")
                     .on_hover_text("Every second span is sorted the other way round (herringbone)");
                 ui.end_row();
+                // BLENDING
+                ui.label(important_text("Blend"));
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(format!("blend_combo_{}", id))
+                        .selected_text(format!("{:?}", self.values.blend))
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for mode in BlendMode::ALL {
+                                ui.selectable_value(&mut self.values.blend, mode, format!("{:?}", mode));
+                            }
+                        })
+                        .response
+                        .on_hover_text("How this layer is combined with the image below it");
+                    ui.spacing_mut().slider_width = 100.0;
+                    ui.add(
+                        egui::Slider::new(&mut self.values.opacity, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                            .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
+                    )
+                    .on_hover_text("Opacity of this layer");
+                });
+                ui.end_row();
             });
     }
 
@@ -559,8 +593,12 @@ impl PixelsorterGui {
             .as_ref()
             .map(|ls| ls.get_current_paint_mask().is_some())
             .unwrap_or(false);
+        let is_threshold = selector_is_threshold(self.values.selector);
         // What to do with the mask after the buttons were drawn
         let mut new_mask: Option<Option<GrayImage>> = None;
+        let mut save_mask = false;
+        let mut load_mask = false;
+        let mut mask_from_threshold = false;
 
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal(|ui| {
@@ -573,12 +611,19 @@ impl PixelsorterGui {
                     ui.selectable_value(&mut self.brush_erase, false, "Paint");
                     ui.selectable_value(&mut self.brush_erase, true, "Erase");
                     ui.label("Size");
+                    ui.spacing_mut().slider_width = 130.0;
                     let slider = egui::Slider::new(&mut self.brush_radius, 1.0..=1000.0)
                         .logarithmic(true)
                         .clamping(SliderClamping::Never)
                         .max_decimals(0)
                         .suffix(" px");
                     ui.add(slider);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Hardness");
+                    ui.spacing_mut().slider_width = 130.0;
+                    ui.add(egui::Slider::new(&mut self.brush_hardness, 0.0..=1.0).fixed_decimals(2))
+                        .on_hover_text("1 = hard edge. Lower values give soft edges that blend the sorted layer smoothly into the image");
                 });
             });
             ui.horizontal(|ui| {
@@ -602,6 +647,21 @@ impl PixelsorterGui {
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(has_mask, Button::new("Save...")).on_hover_text("Save the mask as a black and white image").clicked() {
+                    save_mask = true;
+                }
+                if ui.button("Load...").on_hover_text("Load a black and white image as mask (white = sorted)").clicked() {
+                    load_mask = true;
+                }
+                if ui
+                    .add_enabled(is_threshold, Button::new("From threshold"))
+                    .on_hover_text("Create the mask from the threshold selector (what 'Show mask' shows), then paint on it")
+                    .clicked()
+                {
+                    mask_from_threshold = true;
+                }
+            });
             let hint = if has_mask {
                 "Only the red area is sorted. Left click paints, right click erases."
             } else if self.mask_edit {
@@ -612,8 +672,61 @@ impl PixelsorterGui {
             ui.label(RichText::new(hint).small());
         });
 
+        if save_mask {
+            self.save_paint_mask();
+        }
+        if load_mask {
+            if let Some(mask) = self.load_paint_mask() {
+                new_mask = Some(Some(mask));
+            }
+        }
+        if mask_from_threshold {
+            if let Some(ls) = &mut self.layered_sorter {
+                // White where the threshold selects pixels
+                if let Some(threshold_mask) = ls.get_mask_for_current_layer() {
+                    let (w, h) = threshold_mask.dimensions();
+                    let values: Vec<u8> = threshold_mask.pixels().map(|p| p.0[0]).collect();
+                    new_mask = GrayImage::from_raw(w, h, values).map(Some);
+                }
+            }
+        }
         if let Some(mask) = new_mask {
             self.replace_paint_mask(mask);
+        }
+    }
+
+    /// Saves the mask of the current layer as an image file
+    fn save_paint_mask(&self) {
+        let Some(mask) = self.layered_sorter.as_ref().and_then(|ls| ls.get_current_paint_mask()) else { return };
+        let suggested = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}-mask.png", s.to_string_lossy()))
+            .unwrap_or_else(|| "mask.png".to_string());
+        if let Some(file) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(suggested).save_file() {
+            match mask.save(&file) {
+                Ok(_) => info!("Saved mask to '{}'", file.to_string_lossy()),
+                Err(e) => warn!("Saving the mask failed: {}", e),
+            }
+        }
+    }
+
+    /// Lets the user pick an image and returns it as a mask with the size of the current image
+    fn load_paint_mask(&self) -> Option<GrayImage> {
+        let ls = self.layered_sorter.as_ref()?;
+        let file = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()?;
+        match image::open(&file) {
+            Ok(img) => {
+                let (w, h) = ls.image_size();
+                Some(img.resize_exact(w, h, image::imageops::FilterType::Triangle).into_luma8())
+            }
+            Err(e) => {
+                warn!("Could not open mask '{}': {}", file.to_string_lossy(), e);
+                None
+            }
         }
     }
 
@@ -733,7 +846,7 @@ impl PixelsorterGui {
 
             let item_frame = Frame::default()
                 .inner_margin(0.0)
-                .stroke(Stroke::new(1.0, Color32::DARK_GRAY));
+                .stroke(Stroke::new(1.0_f32, Color32::DARK_GRAY));
 
             // ADD LAYER (+)
             let button = Button::new(RichText::new("+").heading());
@@ -815,7 +928,7 @@ impl PixelsorterGui {
             // When there is no layered sorter, f.e. when sorting videos
             let item_frame = Frame::default()
                 .inner_margin(0.0)
-                .stroke(Stroke::new(1.0, Color32::DARK_GRAY));
+                .stroke(Stroke::new(1.0_f32, Color32::DARK_GRAY));
 
             flex.add_ui(item().basis(30.0).frame(item_frame), |ui| {
                 ui.set_min_width(ui.available_width());

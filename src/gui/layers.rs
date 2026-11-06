@@ -1,6 +1,7 @@
 use image::{GrayImage, Luma, RgbImage};
 use pixelsortery::Pixelsorter;
 
+use super::blend::render_layer;
 use super::PixelsorterValues;
 
 pub(crate) struct LayeredSorter {
@@ -13,7 +14,7 @@ pub(crate) struct SortingLayer {
     sorting_values: PixelsorterValues,
     sorted_img: RgbImage,
     needs_sorting: bool,
-    /// Painted mask: only pixels where the mask is white (>= 128) get sorted.
+    /// Painted mask: where the layer is applied (white = fully, gray = partly, black = not at all).
     /// None means the whole image is sorted.
     paint_mask: Option<GrayImage>,
     /// Increased every time the painted mask or the guide changes, to detect outdated background results
@@ -28,8 +29,8 @@ pub(crate) struct SortJob {
     pub(crate) start: usize,
     /// The image the first layer is applied to
     input: RgbImage,
-    /// Sorter, mask and guide for every layer from `start` up to the current layer
-    steps: Vec<(Pixelsorter, Option<GrayImage>, Option<GrayImage>)>,
+    /// Values, mask and guide for every layer from `start` up to the current layer
+    steps: Vec<(PixelsorterValues, Option<GrayImage>, Option<GrayImage>)>,
     /// Values and mask revisions the job was created with
     checks: Vec<(PixelsorterValues, u64)>,
 }
@@ -39,8 +40,8 @@ impl SortJob {
     pub(crate) fn run(self) -> SortJobResult {
         let mut results = Vec::with_capacity(self.steps.len());
         let mut img = self.input;
-        for (ps, mask, guide) in &self.steps {
-            ps.sort_with_mask_and_guide(&mut img, mask.as_ref(), guide.as_ref());
+        for (values, mask, guide) in &self.steps {
+            img = values.render(&img, mask.as_ref(), guide.as_ref());
             results.push(img.clone());
         }
         SortJobResult { start: self.start, images: results, checks: self.checks }
@@ -143,7 +144,7 @@ impl LayeredSorter {
             input,
             steps: layers
                 .iter()
-                .map(|l| (l.sorting_values.to_pixelsorter(), l.paint_mask.clone(), l.guide.clone()))
+                .map(|l| (l.sorting_values, l.paint_mask.clone(), l.guide.clone()))
                 .collect(),
             checks: layers.iter().map(|l| (l.sorting_values, l.mask_revision)).collect(),
         })
@@ -370,11 +371,7 @@ impl SortingLayer {
     }
 
     fn sort(&mut self, img: &RgbImage) {
-        let mut sorted_img = img.clone();
-        self.sorting_values
-            .to_pixelsorter()
-            .sort_with_mask_and_guide(&mut sorted_img, self.paint_mask.as_ref(), self.guide.as_ref());
-        self.sorted_img = sorted_img;
+        self.sorted_img = self.sorting_values.render(img, self.paint_mask.as_ref(), self.guide.as_ref());
         self.needs_sorting = false;
     }
 
@@ -384,5 +381,12 @@ impl SortingLayer {
             return Some(masked_img);
         }
         None
+    }
+}
+
+impl PixelsorterValues {
+    /// Sorts the image with these values and blends the result over it (blend mode, opacity, mask)
+    pub(crate) fn render(&self, img: &RgbImage, mask: Option<&GrayImage>, guide: Option<&GrayImage>) -> RgbImage {
+        render_layer(&self.to_pixelsorter(), self.blend, self.opacity, img, mask, guide)
     }
 }

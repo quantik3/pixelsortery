@@ -27,7 +27,11 @@ use std::{
 };
 
 use crate::{AUTHORS, PACKAGE_NAME, VERSION};
+mod blend;
+mod brush;
 mod layers;
+use blend::BlendMode;
+use brush::paint_mask_stroke;
 
 /// How long the "Saved" Label should be visible before it vanishes
 const SAVED_LABEL_VANISH_TIMEOUT: f32 = 2.0;
@@ -103,6 +107,8 @@ struct PixelsorterGui {
     brush_radius: f32,
     /// The left mouse button erases instead of paints (the right mouse button always does the opposite)
     brush_erase: bool,
+    /// 1 = hard brush edge, smaller = softer edge
+    brush_hardness: f32,
     /// Texture of the mask overlay
     mask_texture: Option<TextureHandle>,
     /// The mask texture has to be rebuilt (layer changed, mask replaced, ...)
@@ -165,6 +171,10 @@ struct PixelsorterValues {
     channels: ChannelMode,
     /// Posterize levels (0 = off)
     posterize: u8,
+    /// How the layer is combined with the image below
+    blend: BlendMode,
+    /// Opacity of the layer (0 - 1)
+    opacity: f32,
 }
 
 /// A sort running in a background thread
@@ -263,6 +273,8 @@ impl Default for PixelsorterGui {
                 amount: 0.5,
                 channels: ChannelMode::All,
                 posterize: 0,
+                blend: BlendMode::Normal,
+                opacity: 1.0,
                 selector_edges: PixelSelector::Edges { threshold: 80 },
                 path_center: DEFAULT_CENTER,
                 alternate: false,
@@ -287,6 +299,7 @@ impl Default for PixelsorterGui {
             show_mask_overlay: true,
             brush_radius: 30.0,
             brush_erase: false,
+            brush_hardness: 1.0,
             mask_texture: None,
             mask_texture_dirty: true,
             mask_stroke_active: false,
@@ -558,7 +571,7 @@ impl PixelsorterGui {
                 let current = to_img(pos);
                 let from = self.last_brush_pos.unwrap_or(current);
                 let mask = ls.get_current_paint_mask_mut();
-                changed_region = paint_mask_stroke(mask, from, current, self.brush_radius, if erase { 0 } else { 255 });
+                changed_region = paint_mask_stroke(mask, from, current, self.brush_radius, erase, self.brush_hardness);
                 if !had_mask {
                     // The mask was just created, the overlay has to be built from scratch
                     self.mask_texture_dirty = true;
@@ -607,8 +620,8 @@ impl PixelsorterGui {
         if let Some(p) = hover_pos {
             if rect.contains(p) || self.mask_stroke_active {
                 let r = (self.brush_radius * scale_x).max(1.0);
-                ui.painter().circle_stroke(p, r, Stroke::new(2.0, Color32::BLACK));
-                ui.painter().circle_stroke(p, r, Stroke::new(1.0, Color32::WHITE));
+                ui.painter().circle_stroke(p, r, Stroke::new(2.0_f32, Color32::BLACK));
+                ui.painter().circle_stroke(p, r, Stroke::new(1.0_f32, Color32::WHITE));
             }
         }
 
@@ -629,7 +642,7 @@ impl PixelsorterGui {
         // Crosshair at the mouse
         if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(p) {
-                let stroke = Stroke::new(1.0, Color32::YELLOW);
+                let stroke = Stroke::new(1.0_f32, Color32::YELLOW);
                 painter.line_segment([pos2(rect.min.x, p.y), pos2(rect.max.x, p.y)], stroke);
                 painter.line_segment([pos2(p.x, rect.min.y), pos2(p.x, rect.max.y)], stroke);
             }
@@ -637,7 +650,7 @@ impl PixelsorterGui {
         // The current center
         let (cx, cy) = self.values.path_center;
         let current = pos2(rect.min.x + cx * rect.width(), rect.min.y + cy * rect.height());
-        painter.circle_stroke(current, 6.0, Stroke::new(2.0, Color32::YELLOW));
+        painter.circle_stroke(current, 6.0, Stroke::new(2.0_f32, Color32::YELLOW));
 
         if response.clicked() {
             if let Some(p) = response.interact_pointer_pos() {
@@ -1007,9 +1020,11 @@ impl eframe::App for PixelsorterGui {
             .max_width(380.0)
             .show(ctx, |ui| {
                 ui.add_space(5.0);
+                // Limit the width: content that is too wide must not push the image to the right
+                let panel_width = ui.available_width();
                 ScrollArea::vertical()
                     .max_height(f32::INFINITY)
-                    .max_width(f32::INFINITY)
+                    .max_width(panel_width)
                     .show(ui, |ui| {
                         ui.group(|ui| {
                             ui.set_width(full_width(&ui));
@@ -1322,51 +1337,12 @@ fn mask_overlay_image(mask: &GrayImage, region: [u32; 4]) -> ColorImage {
     for y in y0..y1 {
         let row = (y * w) as usize;
         for x in x0..x1 {
-            if raw[row + x as usize] >= 128 {
-                rgba.extend_from_slice(&MASK_OVERLAY_COLOR);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
+            let v = raw[row + x as usize] as u16;
+            let [r, g, b, a] = MASK_OVERLAY_COLOR;
+            // Soft mask: the overlay fades out with the mask
+            rgba.extend_from_slice(&[r, g, b, (a as u16 * v / 255) as u8]);
         }
     }
     ColorImage::from_rgba_unmultiplied([(x1 - x0) as usize, (y1 - y0) as usize], &rgba)
 }
 
-/// Paints a line of circles from `from` to `to` (image coordinates) into the mask.
-/// Returns the changed region `[x0, y0, x1, y1]` (end exclusive), or None if nothing inside the image was touched.
-fn paint_mask_stroke(mask: &mut GrayImage, from: (f32, f32), to: (f32, f32), radius: f32, value: u8) -> Option<[u32; 4]> {
-    let (w, h) = (mask.width() as i64, mask.height() as i64);
-    let r = radius.max(0.5);
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let distance = (dx * dx + dy * dy).sqrt();
-    // Place the circles close enough to get a smooth line
-    let steps = ((distance / (r * 0.3).max(0.5)).ceil() as usize).max(1);
-    let raw: &mut [u8] = mask;
-    let mut region: Option<[i64; 4]> = None;
-
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let (cx, cy) = (from.0 + dx * t, from.1 + dy * t);
-        let x0 = ((cx - r).floor() as i64).max(0);
-        let y0 = ((cy - r).floor() as i64).max(0);
-        let x1 = ((cx + r).ceil() as i64).min(w - 1);
-        let y1 = ((cy + r).ceil() as i64).min(h - 1);
-        if x0 > x1 || y0 > y1 {
-            continue;
-        }
-        for y in y0..=y1 {
-            let py = y as f32 + 0.5 - cy;
-            for x in x0..=x1 {
-                let px = x as f32 + 0.5 - cx;
-                if px * px + py * py <= r * r {
-                    raw[(y * w + x) as usize] = value;
-                }
-            }
-        }
-        region = Some(match region {
-            None => [x0, y0, x1 + 1, y1 + 1],
-            Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1 + 1), d.max(y1 + 1)],
-        });
-    }
-    region.map(|[a, b, c, d]| [a as u32, b as u32, c as u32, d as u32])
-}
