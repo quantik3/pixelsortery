@@ -64,6 +64,43 @@ pub(crate) struct SortJob {
     preview: bool,
 }
 
+/// Everything needed to apply the whole layer stack to any image (frames of an animation or a video).
+/// One layer can be animated: its values move from `start` to `end`.
+#[derive(Clone)]
+pub(crate) struct StackRenderer {
+    steps: Vec<(PixelsorterValues, Option<GrayImage>, Option<GrayImage>, Option<Arc<Vec<f32>>>)>,
+    /// (index of the animated layer, values at the start, values at the end)
+    animation: Option<(usize, PixelsorterValues, PixelsorterValues)>,
+}
+
+impl StackRenderer {
+    /// Index of the first layer that changes during the animation (all layers below stay the same)
+    pub(crate) fn first_animated_layer(&self) -> usize {
+        self.animation.map(|a| a.0).unwrap_or(0).min(self.steps.len())
+    }
+
+    /// Applies the layers `from..` to the image, at the animation time `t` (0 = start, 1 = end)
+    pub(crate) fn render_from(&self, img: &RgbImage, from: usize, t: f32) -> RgbImage {
+        let mut img = img.clone();
+        for (i, (values, mask, guide, directions)) in self.steps.iter().enumerate().skip(from) {
+            let values = match self.animation {
+                Some((index, start, end)) if index == i => start.lerp(&end, t),
+                _ => *values,
+            };
+            img = values.render(&img, mask.as_ref(), guide.as_ref(), directions.as_deref().map(|d| d.as_slice()));
+        }
+        img
+    }
+
+    /// Applies the layers below the animated one (they are the same for every frame)
+    pub(crate) fn render_static_part(&self, img: &RgbImage) -> RgbImage {
+        let mut below = self.clone();
+        below.steps.truncate(self.first_animated_layer());
+        below.animation = None;
+        below.render_from(img, 0, 0.0)
+    }
+}
+
 /// Longer side of the image in a quick preview
 const PREVIEW_SIZE: u32 = 1000;
 
@@ -339,6 +376,19 @@ impl LayeredSorter {
         }
     }
 
+    /// Everything needed to apply all layers to other images (animation frames, video frames).
+    /// With `animation` = (start, end), the current layer is animated between these values.
+    pub(crate) fn stack_renderer(&self, animation: Option<(PixelsorterValues, PixelsorterValues)>) -> StackRenderer {
+        StackRenderer {
+            steps: self
+                .layers
+                .iter()
+                .map(|l| (l.sorting_values, l.paint_mask.clone(), l.guide.clone(), l.directions.clone()))
+                .collect(),
+            animation: animation.map(|(start, end)| (self.current_layer, start, end)),
+        }
+    }
+
     /// Is the state of the layers (not counting which one is selected) the one in the snapshot?
     pub(crate) fn matches_snapshot(&self, snapshot: &StackSnapshot) -> bool {
         self.layers.len() == snapshot.layers.len()
@@ -560,6 +610,63 @@ impl SortingLayer {
 }
 
 impl PixelsorterValues {
+    /// Values between `self` (t = 0) and `end` (t = 1). Numbers move smoothly (if both use the same
+    /// kind of path / selector), everything else switches in the middle.
+    pub(crate) fn lerp(&self, end: &PixelsorterValues, t: f32) -> PixelsorterValues {
+        let t = t.clamp(0.0, 1.0);
+        let f = |a: f32, b: f32| a + (b - a) * t;
+        let int = |a: f64, b: f64| (a + (b - a) * t as f64).round();
+        // Everything that can't move smoothly: start values in the first half, end values in the second
+        let mut v = if t < 0.5 { *self } else { *end };
+
+        v.path = match (self.path, end.path) {
+            (PathCreator::Diagonally(a), PathCreator::Diagonally(b)) => PathCreator::Diagonally(f(a, b)),
+            (PathCreator::Waves(a1, l1, _), PathCreator::Waves(a2, l2, _)) => {
+                let horizontal = matches!(v.path, PathCreator::Waves(_, _, true));
+                PathCreator::Waves(f(a1, a2), f(l1, l2), horizontal)
+            }
+            (PathCreator::FlowField(s1, _), PathCreator::FlowField(s2, _)) => {
+                let seed = if let PathCreator::FlowField(_, seed) = v.path { seed } else { 0 };
+                PathCreator::FlowField(f(s1, s2), seed)
+            }
+            (PathCreator::Star(p1, i1), PathCreator::Star(p2, i2)) => {
+                PathCreator::Star(int(p1 as f64, p2 as f64) as u32, f(i1, i2))
+            }
+            (PathCreator::X3(o1, w1, s1), PathCreator::X3(o2, w2, s2)) => PathCreator::X3(
+                int(o1 as f64, o2 as f64) as i32,
+                int(w1 as f64, w2 as f64) as i64,
+                s1 + (s2 - s1) * t as f64,
+            ),
+            _ => v.path,
+        };
+        v.selector = match (self.selector, end.selector) {
+            (PixelSelector::Fixed { len: a }, PixelSelector::Fixed { len: b }) => {
+                PixelSelector::Fixed { len: int(a as f64, b as f64) as u64 }
+            }
+            (PixelSelector::Random { max: a }, PixelSelector::Random { max: b }) => {
+                PixelSelector::Random { max: int(a as f64, b as f64) as u32 }
+            }
+            (PixelSelector::Edges { threshold: a }, PixelSelector::Edges { threshold: b }) => {
+                PixelSelector::Edges { threshold: int(a as f64, b as f64) as u64 }
+            }
+            (
+                PixelSelector::Threshold { min: min1, max: max1, criteria: c1 },
+                PixelSelector::Threshold { min: min2, max: max2, criteria: c2 },
+            ) if c1 == c2 => PixelSelector::Threshold {
+                min: int(min1 as f64, min2 as f64) as u64,
+                max: int(max1 as f64, max2 as f64) as u64,
+                criteria: c1,
+            },
+            _ => v.selector,
+        };
+        v.path_center = (f(self.path_center.0, end.path_center.0), f(self.path_center.1, end.path_center.1));
+        v.passes = int(self.passes as f64, end.passes as f64) as u32;
+        v.amount = f(self.amount, end.amount);
+        v.opacity = f(self.opacity, end.opacity);
+        v.posterize = int(self.posterize as f64, end.posterize as f64) as u8;
+        v
+    }
+
     /// The values for an image scaled by `scale`: lengths in pixels are scaled too
     pub(crate) fn scaled(&self, scale: f32) -> PixelsorterValues {
         let px = |v: f32| v * scale;

@@ -37,6 +37,10 @@ struct Transcoder {
     progress: Progress,
     progress_sender: Sender<Progress>,
     cancel_signal: Arc<AtomicBool>,
+    /// Number of frames given to the filter so far
+    filtered_frames: u64,
+    /// Estimated number of frames of the video
+    frame_count: u64,
     // enc_opts: ffmpeg::Dictionary,
     // loglevel: log::Level,
 }
@@ -162,14 +166,17 @@ impl Transcoder {
             progress: Progress::default(),
             progress_sender,
             cancel_signal,
+            filtered_frames: 0,
+            frame_count: 1,
             // loglevel: log::Level::Info,
         })
     }
 
     /// Starts transcoding.
     /// 
+    /// `img_filter(image, frame_index, frame_count)` is called for every frame
     fn transcode<F>(&mut self, img_filter: F) -> Result<(), Box<dyn std::error::Error>>
-        where F: Fn(&mut RgbImage)
+        where F: Fn(&mut RgbImage, u64, u64)
     {
         // Try to find number of frames, for progress printing
         let mut ictx = self.ictx.take().unwrap(); // Hacky. Take ictx to prevent conflicts of borrowing self twice
@@ -183,6 +190,7 @@ impl Transcoder {
                 / input_stream.avg_frame_rate().denominator() as f32)
                 * duration) as i64
         };
+        self.frame_count = nb_frames.max(1) as u64;
         println!("\n");
         // Go through each data packet and do stuff
         for (stream, mut packet) in ictx.packets().filter_map(Result::ok) {
@@ -233,7 +241,7 @@ impl Transcoder {
 
         // Will be called after every packet sent
     fn receive_and_process_decoded_frames<F>(&mut self, img_filter: &F) -> Result<(), ffmpeg::Error>
-        where F: Fn(&mut RgbImage)
+        where F: Fn(&mut RgbImage, u64, u64)
     {
         let mut decoded_frame = frame::Video::empty();
         while self.decoder.receive_frame(&mut decoded_frame).is_ok() {
@@ -259,7 +267,7 @@ impl Transcoder {
     }
 
     fn manipulate_frame<F> (&mut self, img_filter: F, in_frame: &frame::Video) -> frame::Video
-        where F: Fn(&mut RgbImage)
+        where F: Fn(&mut RgbImage, u64, u64)
     {
         // Create rgb frame and rgb image
         let mut rgb_frame = frame::Video::empty();
@@ -267,7 +275,10 @@ impl Transcoder {
 
         let mut img = frame_to_img(&rgb_frame);
         // Processing frame, yippie!
-        img_filter(&mut img);
+        // The frame count is only an estimate, keep the index below it
+        let index = self.filtered_frames.min(self.frame_count.saturating_sub(1));
+        img_filter(&mut img, index, self.frame_count);
+        self.filtered_frames += 1;
         // Write image back into frame
         img_to_frame(&img, &mut rgb_frame);
 
@@ -311,11 +322,20 @@ impl Pixelsorter {
     }
 
     fn transcode_sorted_video(&self, input_path: &str, output_path: &str) -> ThreadPhone {
+        let ps = self.clone();
+        transcode_video_threaded(input_path, output_path, move |img, _, _| ps.sort(img))
+    }
+}
+
+/// Transcodes a video in a background thread: `filter(image, frame_index, frame_count)` is called for every frame.
+/// The frame count is an estimate from the video's metadata.
+pub fn transcode_video_threaded<F>(input_path: &str, output_path: &str, filter: F) -> ThreadPhone
+    where F: Fn(&mut RgbImage, u64, u64) + Send + 'static
+{
         let (sender, progress_receiver) = std::sync::mpsc::channel::<Progress>();
         let cancel_signal = Arc::new(AtomicBool::new(false));
         // This is probably not how you'd normally solve this, but it works
-        let (ps, i, o, cs) = (
-                self.clone(),
+        let (i, o, cs) = (
                 input_path.to_string(),
                 output_path.to_string(),
                 cancel_signal.clone(),
@@ -324,8 +344,14 @@ impl Pixelsorter {
         // Start thread
         let join_handle = std::thread::spawn(move ||{
             let timer = Instant::now();
-            let mut transcoder = Transcoder::new(&i, &o, sender, cs).unwrap();
-            match transcoder.transcode(|img| ps.sort(img)) {
+            let mut transcoder = match Transcoder::new(&i, &o, sender, cs) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Could not start the video export: {e}");
+                    return;
+                }
+            };
+            match transcoder.transcode(filter) {
                 Ok(_) => {
                     println!("\n=== Success! Finished in {:?} !===", timer.elapsed());
                 },
@@ -335,8 +361,9 @@ impl Pixelsorter {
             };
         });
         ThreadPhone {join_handle, progress_receiver, cancel_signal, last_progress: Progress::default() }
-    }
+}
 
+impl Pixelsorter {
     /// Read a video from an input file, sort it and play the result with ffplay
     /// Does not support audio
     fn stream_sorted_video(&self, input: &str) -> Result<(), Box<dyn std::error::Error>> {

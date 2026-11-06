@@ -23,7 +23,7 @@ use pixelsortery::{
 #[cfg(feature = "video")]
 use pixelsortery::{Progress, ThreadPhone};
 use std::{
-    ffi::OsString, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, mpsc::Receiver, Arc, Mutex}, thread::JoinHandle, time::{Duration, Instant}
+    ffi::OsString, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, mpsc::Receiver, Arc, Mutex}, thread::JoinHandle, time::{Duration, Instant}
 };
 
 use crate::{AUTHORS, PACKAGE_NAME, VERSION};
@@ -150,6 +150,27 @@ struct PixelsorterGui {
     selected_preset: Option<usize>,
     /// Settings text typed or pasted in
     preset_text: String,
+    /// Animation: settings of the current layer at the start and at the end
+    anim_start: Option<PixelsorterValues>,
+    anim_end: Option<PixelsorterValues>,
+    /// Animation: number of frames from start to end
+    anim_frames: u32,
+    /// Animation: frames per second
+    anim_fps: u32,
+    /// Animation: play forwards and backwards (loops smoothly)
+    anim_pingpong: bool,
+    /// Animation: GIFs are shrunk to this longer side (0 = full size)
+    anim_max_size: u32,
+    /// Animation: position of the "try it" slider (0 = start, 1 = end)
+    anim_t: f32,
+    /// A running animation export
+    anim_job: Option<AnimationJob>,
+    /// Result of the last animation export, shown in the panel
+    anim_message: Option<String>,
+    /// The video the current image (a frame) comes from: the layers can be applied to the whole video
+    video_source: Option<PathBuf>,
+    /// Animate the current layer from start to end over the whole video
+    video_animate: bool,
     /// Sort in a background thread, so the window stays responsive
     background_sort: bool,
     /// While a slider is dragged, sort a smaller copy (needs background sorting)
@@ -224,6 +245,22 @@ enum BrushTool {
     Mask,
     /// Directions for the path "Drawn"
     Direction,
+}
+
+/// Where an animation is exported to
+enum AnimationTarget {
+    Gif(PathBuf),
+    /// A folder for numbered PNG files
+    Pngs(PathBuf),
+}
+
+/// An animation export running in a background thread
+struct AnimationJob {
+    handle: JoinHandle<Result<String, String>>,
+    progress: Arc<AtomicU32>,
+    total: u32,
+    cancel: Arc<AtomicBool>,
+    started: Instant,
 }
 
 /// A sort running in a background thread
@@ -369,6 +406,17 @@ impl Default for PixelsorterGui {
             preset_name: String::new(),
             selected_preset: None,
             preset_text: String::new(),
+            anim_start: None,
+            anim_end: None,
+            anim_frames: 30,
+            anim_fps: 15,
+            anim_pingpong: true,
+            anim_max_size: 800,
+            anim_t: 0.0,
+            anim_job: None,
+            anim_message: None,
+            video_source: None,
+            video_animate: false,
             background_sort: true,
             fast_preview: true,
             preview_shown: false,
@@ -941,7 +989,29 @@ impl PixelsorterGui {
     fn open_path(&mut self, ctx: &egui::Context, f: PathBuf) -> bool {
         match image::open(f.as_path()) {
             Ok(i) => {
-                let img = i.into_rgb8();
+                self.video_source = None;
+                self.set_image(ctx, i.into_rgb8(), f);
+                true
+            }
+            Err(e) => {
+                #[cfg(feature = "video")]
+                if self.init_video(ctx, &f).is_ok() {
+                    // TODO: Either use layered sorter or save it for the next loaded image
+                    self.layered_sorter = None;
+                    self.img = None;
+                    self.path = Some(f);
+                    self.video_source = None;
+                    return true;
+                }
+                warn!("Could not open '{}': {}", f.to_string_lossy(), e);
+                false
+            }
+        }
+    }
+
+    /// Uses an image (opened from a file or taken from a video) as the new base image
+    fn set_image(&mut self, ctx: &egui::Context, img: RgbImage, f: PathBuf) {
+        {
                 if let Some(ls) = &mut self.layered_sorter {
                     ls.set_base_img(img.clone());
                 }
@@ -964,20 +1034,144 @@ impl PixelsorterGui {
                 self.update_texture(ctx);
                 self.path = Some(f);
                 self.do_sort = true;
-                true
-            }
-            Err(e) => {
-                #[cfg(feature = "video")]
-                if self.init_video(ctx, &f).is_ok() {
-                    // TODO: Either use layered sorter or save it for the next loaded image
-                    self.layered_sorter = None;
-                    self.img = None;
-                    self.path = Some(f);
-                    return true;
+        }
+    }
+
+    /// The values of the animation at time t (0 = start, 1 = end), if start and end are set
+    fn animation_values(&self, t: f32) -> Option<PixelsorterValues> {
+        Some(self.anim_start?.lerp(&self.anim_end?, t))
+    }
+
+    /// Exports the animation of the current layer (from start to end) in a background thread
+    fn start_animation_export(&mut self, target: AnimationTarget) {
+        let (Some(ls), Some(start), Some(end)) = (&self.layered_sorter, self.anim_start, self.anim_end) else {
+            return;
+        };
+        let renderer = ls.stack_renderer(Some((start, end)));
+        let base = ls.get_base_img().clone();
+        let frames = self.anim_frames.max(2);
+        let mut times: Vec<f32> = (0..frames).map(|k| k as f32 / (frames - 1) as f32).collect();
+        if self.anim_pingpong {
+            // Back again, without repeating the first and last frame
+            let back: Vec<f32> = times[1..times.len() - 1].iter().rev().copied().collect();
+            times.extend(back);
+        }
+        let total = times.len() as u32;
+        let fps = self.anim_fps.clamp(1, 100);
+        let max_size = self.anim_max_size;
+        let progress = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (thread_progress, thread_cancel) = (progress.clone(), cancel.clone());
+
+        let handle = std::thread::spawn(move || -> Result<String, String> {
+            // The layers below the animated one are the same in every frame
+            let below = renderer.render_static_part(&base);
+            let from = renderer.first_animated_layer();
+            let frame_at = |t: f32| renderer.render_from(&below, from, t);
+            match target {
+                AnimationTarget::Gif(path) => {
+                    use image::codecs::gif::{GifEncoder, Repeat};
+                    let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                    let mut encoder = GifEncoder::new_with_speed(std::io::BufWriter::new(file), 10);
+                    encoder.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+                    for (k, t) in times.iter().enumerate() {
+                        if thread_cancel.load(Ordering::Relaxed) {
+                            return Ok("Stopped".to_string());
+                        }
+                        let mut frame = frame_at(*t);
+                        let (w, h) = frame.dimensions();
+                        if max_size > 0 && w.max(h) > max_size {
+                            let scale = max_size as f32 / w.max(h) as f32;
+                            let (sw, sh) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+                            frame = image::imageops::resize(&frame, sw, sh, image::imageops::FilterType::Triangle);
+                        }
+                        let rgba = image::DynamicImage::ImageRgb8(frame).into_rgba8();
+                        let delay = image::Delay::from_numer_denom_ms(1000, fps);
+                        encoder
+                            .encode_frame(image::Frame::from_parts(rgba, 0, 0, delay))
+                            .map_err(|e| e.to_string())?;
+                        thread_progress.store(k as u32 + 1, Ordering::Relaxed);
+                    }
+                    Ok(format!("Saved {}", path.to_string_lossy()))
                 }
-                warn!("Could not open '{}': {}", f.to_string_lossy(), e);
-                false
+                AnimationTarget::Pngs(dir) => {
+                    for (k, t) in times.iter().enumerate() {
+                        if thread_cancel.load(Ordering::Relaxed) {
+                            return Ok("Stopped".to_string());
+                        }
+                        let file = dir.join(format!("frame_{:04}.png", k + 1));
+                        frame_at(*t).save(&file).map_err(|e| e.to_string())?;
+                        thread_progress.store(k as u32 + 1, Ordering::Relaxed);
+                    }
+                    Ok(format!("Saved {} frames to {}", times.len(), dir.to_string_lossy()))
+                }
             }
+        });
+        self.anim_message = None;
+        self.anim_job = Some(AnimationJob { handle, progress, total, cancel, started: Instant::now() });
+    }
+
+    /// Shows the progress of a running animation export and picks up its result
+    fn animation_export_modal(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.anim_job else { return };
+        if job.handle.is_finished() {
+            let job = self.anim_job.take().unwrap();
+            self.anim_message = Some(match job.handle.join() {
+                Ok(Ok(message)) => message,
+                Ok(Err(e)) => format!("Export failed: {}", e),
+                Err(_) => "Export failed".to_string(),
+            });
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let (done, total, elapsed) = (job.progress.load(Ordering::Relaxed), job.total, job.started.elapsed());
+        let cancel = job.cancel.clone();
+        Modal::new("AnimationExportModal".into()).show(ctx, |ui| {
+            ui.heading("Exporting animation...");
+            ui.separator();
+            ui.label(format!("Frame {} / {}", done, total));
+            ui.label(format!("Time elapsed: {:.1}s", elapsed.as_secs_f32()));
+            ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32));
+            if ui.button(RichText::new("Stop").heading()).clicked() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Applies all layers (and the animation, if wanted) to every frame of the video the current frame comes from
+    #[cfg(feature = "video")]
+    fn start_video_export_with_layers(&mut self) {
+        let (Some(ls), Some(source)) = (&self.layered_sorter, self.video_source.clone()) else { return };
+        let animation = if self.video_animate { self.anim_start.zip(self.anim_end) } else { None };
+        let renderer = ls.stack_renderer(animation);
+        let Some(output) = rfd::FileDialog::new()
+            .add_filter("Videos", &["mp4", "mov", "webm", "avi", "mkv", "m4v", "mpg"])
+            .save_file()
+        else {
+            return;
+        };
+        let phone = pixelsortery::transcode_video_threaded(
+            &source.to_string_lossy(),
+            &output.to_string_lossy(),
+            move |img, index, count| {
+                let t = if count > 1 { index as f32 / (count - 1) as f32 } else { 0.0 };
+                *img = renderer.render_from(img, 0, t);
+            },
+        );
+        self.video_thread_phone = Some(phone);
+    }
+
+    /// Takes the frame shown in the video player (unsorted, from the file) as image, to edit it with layers and masks
+    #[cfg(feature = "video")]
+    fn edit_video_frame(&mut self, ctx: &egui::Context, elapsed_ms: i64) {
+        let Some(path) = self.path.clone() else { return };
+        match pixelsortery::extract_video_frame(&path.to_string_lossy(), elapsed_ms.max(0) as f32 / 1000.0) {
+            Ok(Some(frame)) => {
+                self.set_image(ctx, frame, path.clone());
+                self.video_source = Some(path);
+            }
+            Ok(None) => warn!("Could not read the frame at {} ms", elapsed_ms),
+            Err(e) => warn!("Could not read the frame: {}", e),
         }
     }
 
@@ -1238,6 +1432,7 @@ impl eframe::App for PixelsorterGui {
 
         // Pick up results of the background sort
         self.poll_background_sort(ctx);
+        self.animation_export_modal(ctx);
         // After a preview: sort the full image once the mouse is released
         if self.preview_shown && !ctx.input(|i| i.pointer.any_down()) {
             self.preview_shown = false;
@@ -1400,6 +1595,17 @@ impl eframe::App for PixelsorterGui {
                         ui.group(|ui| {
                             self.presets_panel(ui);
                         });
+                        ui.add_space(5.0);
+                        ui.group(|ui| {
+                            self.animation_panel(ui);
+                        });
+                        #[cfg(feature = "video")]
+                        if self.video_source.is_some() {
+                            ui.add_space(5.0);
+                            ui.group(|ui| {
+                                self.video_layers_panel(ui);
+                            });
+                        }
 
                         ui.add_space(5.0);
 

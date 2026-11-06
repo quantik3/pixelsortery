@@ -728,6 +728,130 @@ impl PixelsorterGui {
             });
     }
 
+    pub(super) fn animation_panel(&mut self, ui: &mut Ui) {
+        ui.set_width(full_width(&ui));
+        let enabled = self.layered_sorter.is_some() && self.anim_job.is_none();
+        let current_layer = self.layered_sorter.as_ref().map(|ls| ls.get_current_index()).unwrap_or(0);
+        egui::CollapsingHeader::new(important_text("Animation"))
+            .id_salt("animation_header")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Layer [{}] moves from the start to the end settings. Set up the layer, press 'Set', change it, press 'Set' at the end.",
+                            current_layer
+                        ))
+                        .small(),
+                    );
+                    egui::Grid::new("animation_grid").num_columns(2).min_row_height(22.0).show(ui, |ui| {
+                        ui.spacing_mut().slider_width = 120.0;
+                        for (label, is_start) in [("Start", true), ("End", false)] {
+                            ui.label(important_text(label));
+                            ui.horizontal(|ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                if ui.button("Set").on_hover_text("Use the current settings of the layer").clicked() {
+                                    if is_start {
+                                        self.anim_start = Some(self.values);
+                                    } else {
+                                        self.anim_end = Some(self.values);
+                                    }
+                                }
+                                let values = if is_start { self.anim_start } else { self.anim_end };
+                                let text = values
+                                    .map(|v| v.to_pixelsorter().to_pretty_short_string())
+                                    .unwrap_or_else(|| "not set".to_string());
+                                ui.label(RichText::new(text).small().monospace());
+                            });
+                            ui.end_row();
+                        }
+                        ui.label(important_text("Frames"));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.anim_frames).range(2..=1000));
+                            ui.label("at");
+                            ui.add(egui::DragValue::new(&mut self.anim_fps).range(1..=60).suffix(" fps"));
+                            ui.checkbox(&mut self.anim_pingpong, "Ping-pong")
+                                .on_hover_text("Play forwards and then backwards, so the loop has no jump");
+                        });
+                        ui.end_row();
+                        ui.label(important_text("GIF size"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.anim_max_size)
+                                .range(0..=8000)
+                                .suffix(" px")
+                                .custom_formatter(|v, _| if v < 1.0 { "full size".to_string() } else { format!("{} px", v as u32) }),
+                        )
+                        .on_hover_text("Longer side of the GIF (0 = full size). Big GIFs get huge and slow");
+                        ui.end_row();
+                        let both_set = self.anim_start.is_some() && self.anim_end.is_some();
+                        ui.label(important_text("Try"));
+                        let response = ui.add_enabled(both_set, egui::Slider::new(&mut self.anim_t, 0.0..=1.0).fixed_decimals(2));
+                        if response.changed() {
+                            if let Some(values) = self.animation_values(self.anim_t) {
+                                self.set_values(values);
+                            }
+                        }
+                        response.on_hover_text("Shows the layer at this point of the animation (Ctrl+Z goes back)");
+                        ui.end_row();
+                    });
+                    let both_set = self.anim_start.is_some() && self.anim_end.is_some();
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(both_set, Button::new("Export GIF...")).clicked() {
+                            let suggested = self
+                                .path
+                                .as_ref()
+                                .and_then(|p| p.file_stem())
+                                .map(|s| format!("{}-animated.gif", s.to_string_lossy()))
+                                .unwrap_or_else(|| "animation.gif".to_string());
+                            if let Some(file) = rfd::FileDialog::new().add_filter("GIF", &["gif"]).set_file_name(suggested).save_file() {
+                                self.start_animation_export(AnimationTarget::Gif(file));
+                            }
+                        }
+                        if ui
+                            .add_enabled(both_set, Button::new("Export PNG frames..."))
+                            .on_hover_text("Numbered PNG files in full quality, e.g. to make a video from them")
+                            .clicked()
+                        {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                self.start_animation_export(AnimationTarget::Pngs(dir));
+                            }
+                        }
+                    });
+                    if let Some(message) = &self.anim_message {
+                        ui.label(RichText::new(message).small());
+                    }
+                });
+            });
+    }
+
+    /// Shown when the image is a frame of a video: apply the layers to the whole video
+    #[cfg(feature = "video")]
+    pub(super) fn video_layers_panel(&mut self, ui: &mut Ui) {
+        let Some(source) = self.video_source.clone() else { return };
+        ui.set_width(full_width(&ui));
+        ui.horizontal(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            ui.label(important_text("Video"));
+            ui.label(
+                RichText::new(source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+                    .small(),
+            );
+        });
+        ui.label(RichText::new("You are editing one frame. Layers, masks and directions are applied to every frame.").small());
+        ui.horizontal(|ui| {
+            let can_animate = self.anim_start.is_some() && self.anim_end.is_some();
+            ui.add_enabled(can_animate, egui::Checkbox::new(&mut self.video_animate, "Animate"))
+                .on_hover_text("The current layer moves from the animation start to the end settings over the video");
+            if ui.add_enabled(self.video_thread_phone.is_none(), Button::new("Export video...")).clicked() {
+                self.start_video_export_with_layers();
+            }
+            if ui.button("Back to video").clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_path(&ctx, source.clone());
+            }
+        });
+    }
+
     pub(super) fn mask_panel(&mut self, ui: &mut Ui) {
         ui.set_width(full_width(&ui));
         let enabled = self.layered_sorter.is_some();
@@ -964,6 +1088,7 @@ impl PixelsorterGui {
     pub(super) fn video_panel(&mut self, ui: &mut Ui) {
         let mut current_frame = None;
         let mut do_export = false;
+        let mut edit_frame_at = None;
         if let Some(player) = &mut self.video_player {
             ui.with_layout(Layout::bottom_up(Align::Center).with_cross_justify(true), |ui|{
                 ui.group(|ui| {
@@ -976,6 +1101,14 @@ impl PixelsorterGui {
                         if ui.button("Start Export").clicked() {
                             do_export = true;
                             player.pause();
+                        }
+                        if ui
+                            .button("Edit frame with layers")
+                            .on_hover_text("Edit this frame with layers, masks and the brush, then export the whole video with them")
+                            .clicked()
+                        {
+                            player.pause();
+                            edit_frame_at = Some(player.elapsed_ms());
                         }
                         ui.checkbox(&mut player.options.looping, "Loop");
 
@@ -1000,6 +1133,11 @@ impl PixelsorterGui {
 
         if let Some(frame) = current_frame {
             save_image_as(&frame, self.path.as_deref());
+        }
+        if let Some(ms) = edit_frame_at {
+            let ctx = ui.ctx().clone();
+            self.edit_video_frame(&ctx, ms);
+            return;
         }
         if do_export {
             if let Some(path) = self.path.clone() {
